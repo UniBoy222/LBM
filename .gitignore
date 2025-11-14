@@ -1,0 +1,33 @@
+# 编译输出文件
+*.o
+*.obj
+*.exe
+*.out
+*.a
+*.so
+*.dylib
+
+# 编译输出目录
+out/
+build/
+bin/
+
+# IDE 文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 临时文件
+*.tmp
+*.log
+
+# CUDA 编译文件
+*.ptx
+*.cubin
+
