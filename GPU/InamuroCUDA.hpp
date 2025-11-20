@@ -34,22 +34,46 @@ public:
 
 private:
     // ------------ 网格与布局 ------------
-    const Inamuro& cpu_;       // 仅引用，不拥有
-    int lx_ = 0, ly_ = 0, lz_ = 0;
-    int lz_total_ = 0;         // 通常 = lz_ + 2（z方向ghost，两端各1层）
-    int N_cells_  = 0;         // 物理域 cell 数 = lx_*ly_*lz_
-    int N_macro_  = 0;         // 宏观场存储数 = lx_*ly_*lz_total_
-    static constexpr int Q_ = 15; // D3Q15
+    const Inamuro& cpu;       // 仅引用，不拥有
+    int lx = 0, ly = 0, lz = 0;
+    int lz_total = 0;         // 通常 = lz + 2（z方向ghost，两端各1层）
+    int N_cells  = 0;         // 物理域 cell 数 = lx*ly*lz
+    int N_macro  = 0;         // 宏观场存储数 = lx*ly*lz_total
+    static constexpr int Q = 15; // D3Q15
+    
+    // ------------ GPU参数结构体 ------------
+    struct GPUParams {
+        double rho_L, rho_G;     // 液相/气相密度
+        double mu_L, mu_G;       // 液相/气相粘度
+        double tauf, taug;       // 相场/动量松弛时间
+        double k_f, k_g;         // 相场/动量表面张力系数
+        double T, a, b;          // EOS状态方程参数
+        double fei_L, fei_G;     // 液相/气相相场值
+    } params;
+    
+    bool is_first_step = true;   // 标记是否是第一个时间步（与CPU一致）
+    
+    // ------------ 性能测量 ------------
+    struct PerformanceMetrics {
+        double total_collision_time = 0.0;   // 碰撞kernel总时间(ms)
+        double total_stream_time = 0.0;      // 迁移kernel总时间(ms)
+        double total_macro_time = 0.0;       // 宏观量kernel总时间(ms)
+        double total_poisson_time = 0.0;     // 压力泊松总时间(ms)
+        int time_step_count = 0;             // 时间步计数
+    } perf;
+    
+    bool enable_timing = true;      // 是否启用性能测量
+    bool enable_debug = false;      // 是否启用DEBUG输出
 
     // ------------ 设备端字段 ------------
     struct GPUMemory
     {
-        // 分布函数 [Q * N_cells_]
+        // 分布函数 [Q * N_cells]
         double* d_ff = nullptr;
         double* d_gg = nullptr;
         double* d_hh = nullptr;
 
-        // 宏观量 [N_macro_]（带 z 方向 ghost）
+        // 宏观量 [N_macro]（带 z 方向 ghost）
         double* d_rho = nullptr;
         double* d_fei = nullptr;
         double* d_u   = nullptr;
@@ -66,7 +90,7 @@ private:
 
         double* d_fei_lap = nullptr;
         double* d_u_lap   = nullptr; double* d_v_lap = nullptr; double* d_w_lap = nullptr;
-    } gpu_{};
+    } gpu;
 
     // ------------ 内部帮助函数 ------------
     void allocateDeviceMemory();
@@ -79,14 +103,19 @@ private:
     void downloadMacroToCPU(Inamuro& cpuSolver) const;
 
     // ------------ 单步子过程（与 CPU performTimeStep 对齐） ------------
-    void doCollisionAndGradients(); // TODO: 先留空壳，后续替换为你的 collision + (grad/lap) tiled 版本
-    void doStreamFF();              // 示例：pull streaming（可换为你的版本）
-    void doStreamGG();              // 同上
-    void doBoundaryFF();            // TODO: 先留空壳
-    void doBoundaryGG();            // TODO: 先留空壳
-    void doMacro();                 // 已实现：用 ff/gg 计算 rho/fei/u/v/w（基线）
-    void doPressurePoisson();       // TODO: 先留空壳（后续做全 GPU + 并行残差）
-    void doCorrectUVWAndHH();       // TODO: 先留空壳
+    // 组合函数（实际实现）
+    void doCollisionAndGradients();    // collision + 梯度/拉普拉斯计算
+    void doStreamFF();                 // ff迁移
+    void doStreamGG();                 // gg迁移
+    void doBoundaryFF();               // ff边界条件
+    void doBoundaryGG();               // gg边界条件
+    void doMacro();                    // 宏观量计算（对应CPU的getMacro）
+    void doPressurePoisson();          // 压力泊松求解（对应CPU的solvePressurePoisson）
+    void doCorrectUVWAndHH();          // 速度修正+hh更新（对应CPU的correct_uvw+update_hh）
+    
+    // 性能测量辅助函数
+    void printPerformanceMetrics() const;
+    void resetPerformanceMetrics();
 
     // ------------ 内联索引（cell-major / Q-minor） ------------
     static __host__ __device__ inline
@@ -99,6 +128,6 @@ private:
     int idx4D(int q, int x, int y, int z, int lx, int ly, int lz) {
         // z 为物理域索引
         const int cell = (z * ly + y) * lx + x;
-        return cell * Q_ + q;
+        return cell * Q + q;  // 使用Q而非Q_
     }
 };
