@@ -11,6 +11,15 @@
 out/
 build/
 bin/
+CPU/out/
+
+# CPU 运行产物
+CPU/lbm_sim
+CPU/*.pid
+CPU/data/
+CPU/training/
+CPU/run_full_test.sh
+CPU/params_8000.in
 
 # IDE 文件
 .vscode/
@@ -30,4 +39,3 @@ Thumbs.db
 # CUDA 编译文件
 *.ptx
 *.cubin
-
