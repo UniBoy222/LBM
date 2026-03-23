@@ -133,8 +133,24 @@ void InamuroSolver::loadConfiguration(const std::string& filename) // 加载配�
             continue;
         }
 
-        const std::string key = line.substr(0, pos);
-        const std::string value = line.substr(pos + 1);
+        std::string key = line.substr(0, pos);
+        std::string value = line.substr(pos + 1);
+
+        // 去除value中的行内注释（'#'及其后面的内容）
+        const std::size_t comment_pos = value.find('#');
+        if (comment_pos != std::string::npos)
+        {
+            value = value.substr(0, comment_pos);
+        }
+
+        // 去除key和value的前后空白字符
+        auto trim = [](std::string& s) {
+            s.erase(0, s.find_first_not_of(" \t\r\n"));
+            s.erase(s.find_last_not_of(" \t\r\n") + 1);
+        };
+        trim(key);
+        trim(value);
+
         parseOptionalSetting(key, value);
     }
 }
