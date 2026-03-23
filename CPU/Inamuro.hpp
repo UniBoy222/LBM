@@ -2,6 +2,8 @@
 
 #include "LBMBase.hpp"
 #include "common.hpp"
+#include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -65,6 +67,44 @@ protected:
     Parameters params;
 
 public:
+    // 单个场的统计量。
+    // 这里不存方差，只保留排查数值爆炸最直接有用的指标：
+    // 最小值、最大值、平均值、绝对值最大值，以及 NaN/Inf 计数。
+    struct FieldStatistics
+    {
+        double min = std::numeric_limits<double>::max();
+        double max = std::numeric_limits<double>::lowest();
+        double mean = 0.0;
+        double abs_max = 0.0;
+        std::size_t nan_count = 0;
+        std::size_t inf_count = 0;
+    };
+
+    // 某一个时间步结束后，整个物理场的快照统计。
+    // 这份数据会被求解器写入 step_diagnostics.csv，用来观察
+    // rho / fei / u / v / w / |u| / p 是否在某一步突然偏离正常范围。
+    struct DiagnosticsSnapshot
+    {
+        FieldStatistics rho_stats;
+        FieldStatistics fei_stats;
+        FieldStatistics u_stats;
+        FieldStatistics v_stats;
+        FieldStatistics w_stats;
+        FieldStatistics velocity_magnitude_stats;
+        FieldStatistics p_stats;
+    };
+
+    // 输出开关统一放在这里，求解器会在启动时把配置下发给 Inamuro。
+    // 这样后面不管是主程序还是实验脚本，都只需要改参数文件即可。
+    struct OutputConfig
+    {
+        bool enable_tecplot = true;              // 是否写Tecplot二进制文件
+        bool enable_debug_field_csv = false;     // 是否写整场CSV（文件很大，只建议小步数排查时开启）
+        bool enable_step_summary_csv = true;     // 是否写每步统计摘要 CSV
+        std::string output_dir = "out/";         // 输出目录
+        std::string summary_filename = "step_diagnostics.csv";
+    };
+
     // === 构造函数重载 ===
     explicit Inamuro(int nx = 48, int ny = 96, int nz = 128); // 默认网格尺寸构造函数
     explicit Inamuro(const std::string& filename);   // 从文件读取所有参数构造函数
@@ -81,6 +121,9 @@ public:
 
     // === 数据访问接口 ===
     void getGridSize(int& nx, int& ny, int& nz) const override;
+    void setOutputConfig(const OutputConfig& config);
+    const OutputConfig& getOutputConfig() const;
+    DiagnosticsSnapshot collectDiagnostics() const;
 
 private:
     template <typename T>
@@ -139,14 +182,11 @@ private:
     void writeTecplotBinary(int timeStep);                        // 写入Tecplot二进制文件
     void writeDebugOutput(int timeStep);                          // 写入调试文件
     void dumpString(const std::string& str, std::ofstream& file); // 写入字符串
+    static void updateFieldStatistics(FieldStatistics& stats, double value, double weight = 1.0);
+    static void finalizeFieldStatistics(FieldStatistics& stats, std::size_t valid_count, double accumulator);
 
     // === 输出配置 ===
-    struct OutputConfig
-    {
-        bool enable_tecplot = true;      // 是否启用Tecplot二进制文件
-        bool enable_debug = false;       // 是否启用调试文件
-        std::string output_dir = "out/"; // 输出目录
-    } output_config;
+    OutputConfig output_config;
 };
 // 求导模板函数实现
 template <typename T>

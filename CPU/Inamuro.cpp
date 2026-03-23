@@ -1,8 +1,11 @@
 #include "Inamuro.hpp"
 #include <array>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <utility>
 
@@ -342,7 +345,7 @@ void Inamuro::getMacro()
 }
 void Inamuro::performTimeStep()
 {
-    // 1. 基础LBM步骤
+    // 1. 基础LBM步骤：推进 ff / gg，并从分布函数恢复宏观量
     collision(); // 碰撞
     stream(ff);
     stream(gg);                  // 流动
@@ -360,12 +363,17 @@ void Inamuro::performTimeStep()
 
 void Inamuro::writeResults(int timeStep)
 {
+    if (!output_config.output_dir.empty())
+    {
+        std::filesystem::create_directories(output_config.output_dir);
+    }
+
     if (output_config.enable_tecplot)
     {
         writeTecplotBinary(timeStep);
     }
 
-    if (output_config.enable_debug)
+    if (output_config.enable_debug_field_csv)
     {
         writeDebugOutput(timeStep);
     }
@@ -383,6 +391,113 @@ void Inamuro::getGridSize(int& nx, int& ny, int& nz) const
     nx = lx;
     ny = ly;
     nz = lz;
+}
+
+void Inamuro::setOutputConfig(const OutputConfig& config)
+{
+    output_config = config;
+}
+
+const Inamuro::OutputConfig& Inamuro::getOutputConfig() const
+{
+    return output_config;
+}
+
+Inamuro::DiagnosticsSnapshot Inamuro::collectDiagnostics() const
+{
+    DiagnosticsSnapshot snapshot;
+
+    double rho_sum = 0.0;
+    double fei_sum = 0.0;
+    double u_sum = 0.0;
+    double v_sum = 0.0;
+    double w_sum = 0.0;
+    double vel_mag_sum = 0.0;
+    double p_sum = 0.0;
+
+    std::size_t rho_valid = 0;
+    std::size_t fei_valid = 0;
+    std::size_t u_valid = 0;
+    std::size_t v_valid = 0;
+    std::size_t w_valid = 0;
+    std::size_t vel_mag_valid = 0;
+    std::size_t p_valid = 0;
+
+    for (int x = 0; x < lx; ++x)
+    {
+        for (int y = 0; y < ly; ++y)
+        {
+            for (int z = 1; z <= lz; ++z)
+            {
+                const double rho_value = rho[x][y][z];
+                const double fei_value = fei[x][y][z];
+                const double u_value = u[x][y][z];
+                const double v_value = v[x][y][z];
+                const double w_value = w[x][y][z];
+                const double p_value = p[x][y][z];
+                const double vel_mag = std::sqrt(u_value * u_value + v_value * v_value + w_value * w_value);
+
+                updateFieldStatistics(snapshot.rho_stats, rho_value);
+                if (std::isfinite(rho_value))
+                {
+                    rho_sum += rho_value;
+                    ++rho_valid;
+                }
+
+                updateFieldStatistics(snapshot.fei_stats, fei_value);
+                if (std::isfinite(fei_value))
+                {
+                    fei_sum += fei_value;
+                    ++fei_valid;
+                }
+
+                updateFieldStatistics(snapshot.u_stats, u_value);
+                if (std::isfinite(u_value))
+                {
+                    u_sum += u_value;
+                    ++u_valid;
+                }
+
+                updateFieldStatistics(snapshot.v_stats, v_value);
+                if (std::isfinite(v_value))
+                {
+                    v_sum += v_value;
+                    ++v_valid;
+                }
+
+                updateFieldStatistics(snapshot.w_stats, w_value);
+                if (std::isfinite(w_value))
+                {
+                    w_sum += w_value;
+                    ++w_valid;
+                }
+
+                updateFieldStatistics(snapshot.velocity_magnitude_stats, vel_mag);
+                if (std::isfinite(vel_mag))
+                {
+                    vel_mag_sum += vel_mag;
+                    ++vel_mag_valid;
+                }
+
+                updateFieldStatistics(snapshot.p_stats, p_value);
+                if (std::isfinite(p_value))
+                {
+                    p_sum += p_value;
+                    ++p_valid;
+                }
+            }
+        }
+    }
+
+    finalizeFieldStatistics(snapshot.rho_stats, rho_valid, rho_sum);
+    finalizeFieldStatistics(snapshot.fei_stats, fei_valid, fei_sum);
+    finalizeFieldStatistics(snapshot.u_stats, u_valid, u_sum);
+    finalizeFieldStatistics(snapshot.v_stats, v_valid, v_sum);
+    finalizeFieldStatistics(snapshot.w_stats, w_valid, w_sum);
+    finalizeFieldStatistics(snapshot.velocity_magnitude_stats, vel_mag_valid, vel_mag_sum);
+    finalizeFieldStatistics(snapshot.p_stats, p_valid, p_sum);
+
+    return snapshot;
 }
 
 // === 算法实现方法 ===
@@ -858,4 +973,48 @@ void Inamuro::writeDebugOutput(int timeStep)
 
     file.close();
     std::cout << "调试CSV文件已写入: " << filename.str() << std::endl;
+}
+
+void Inamuro::updateFieldStatistics(FieldStatistics& stats, double value, double)
+{
+    if (std::isnan(value))
+    {
+        ++stats.nan_count;
+        return;
+    }
+
+    if (!std::isfinite(value))
+    {
+        ++stats.inf_count;
+        return;
+    }
+
+    if (value < stats.min)
+    {
+        stats.min = value;
+    }
+    if (value > stats.max)
+    {
+        stats.max = value;
+    }
+
+    const double abs_value = std::abs(value);
+    if (abs_value > stats.abs_max)
+    {
+        stats.abs_max = abs_value;
+    }
+}
+
+void Inamuro::finalizeFieldStatistics(FieldStatistics& stats, std::size_t valid_count, double accumulator)
+{
+    if (valid_count == 0)
+    {
+        stats.min = std::numeric_limits<double>::quiet_NaN();
+        stats.max = std::numeric_limits<double>::quiet_NaN();
+        stats.mean = std::numeric_limits<double>::quiet_NaN();
+        stats.abs_max = std::numeric_limits<double>::quiet_NaN();
+        return;
+    }
+
+    stats.mean = accumulator / static_cast<double>(valid_count);
 }
