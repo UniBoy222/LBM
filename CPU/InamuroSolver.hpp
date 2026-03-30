@@ -2,6 +2,7 @@
 
 #include "Inamuro.hpp"
 #include <chrono>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 
@@ -21,6 +22,8 @@ public:
         bool enable_debug_field_csv = false; // 是否按 output_frequency 写整场 CSV
         bool enable_step_summary_csv = true; // 是否每一步写 step_diagnostics.csv
         bool enable_basic_warnings = true;   // 是否在终端输出最基础的数值稳定性告警
+        bool enable_nn_pressure_init = true; // 是否启用 NN 压力初始化
+        bool enable_gpu_inference = false;   // 是否用 GPU 做 NN 推理
         std::string output_dir = "out/";     // 所有输出文件写入这个目录
         std::string step_summary_filename = "step_diagnostics.csv"; // 每步全场统计摘要
     };
@@ -29,7 +32,7 @@ public:
     explicit InamuroSolver(const std::string& filename);
 
     // 析构函数
-    ~InamuroSolver() = default;
+    ~InamuroSolver();
 
     // 禁用拷贝（防止意外复制大对象）
     InamuroSolver(const InamuroSolver&) = delete;
@@ -52,12 +55,23 @@ private:
     int current_time_step;           // 当前时间步
     double init_time_ms;             // 初始化耗时（毫秒）
     double total_step_time_ms = 0.0; // 累计步骤时间（毫秒）
+    double last_step_time_ms = 0.0;  // 最近一步总耗时（毫秒）
     bool warned_negative_rho = false;
     bool warned_non_finite = false;
+    int nn_used_steps = 0;
+    int nn_used_steps_first_200 = 0;
+    int nn_used_steps_after_200 = 0;
+    int first_nn_used_step = -1;
+    int last_nn_used_step = -1;
+    double nn_used_iteration_sum = 0.0;
+    double nn_not_used_iteration_sum = 0.0;
+    int nn_used_iteration_samples = 0;
+    int nn_not_used_iteration_samples = 0;
 
     // 现代C++时间管理
     std::chrono::steady_clock::time_point start_time; // 开始时间
     std::ofstream diagnostics_stream; // step_diagnostics.csv 文件流
+    std::filesystem::path diagnostics_lock_dir; // 防止两个进程同时写同一个诊断文件
 
     // 私有方法
     void loadConfiguration(const std::string& filename); // 加载配置
@@ -73,4 +87,5 @@ private:
     void printCurrentTime() const;                       // 显示当前时间
     void printElapsedTime() const;                       // 打印耗时
     double getElapsedSeconds() const;                    // 获取耗时
+    void releaseDiagnosticsLock();                       // 释放诊断文件锁
 };

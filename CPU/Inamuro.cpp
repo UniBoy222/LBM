@@ -403,6 +403,76 @@ const Inamuro::OutputConfig& Inamuro::getOutputConfig() const
     return output_config;
 }
 
+void Inamuro::loadNeuralNetwork(const std::string& model_path)
+{
+    try
+    {
+        if (use_gpu_inference && !torch::cuda::is_available())
+        {
+            throw std::runtime_error("配置要求 GPU 推理，但当前 libtorch CUDA 不可用");
+        }
+
+        model = torch::jit::load(model_path);
+        model.eval();
+        if (use_gpu_inference)
+        {
+            model.to(torch::kCUDA);
+        }
+        else
+        {
+            model.to(torch::kCPU);
+        }
+        model_loaded = true;
+        std::cout << "TorchScript模型加载成功: " << model_path
+                  << " | 推理设备: " << (use_gpu_inference ? "GPU" : "CPU")
+                  << std::endl;
+    }
+    catch (const std::exception& e)
+    {
+        model_loaded = false;
+        use_neural_network = false;
+        std::cerr << "警告: TorchScript模型加载失败，已自动禁用NN加速: "
+                  << e.what() << std::endl;
+    }
+    catch (const c10::Error& e)
+    {
+        model_loaded = false;
+        use_neural_network = false;
+        std::cerr << "警告: TorchScript模型加载失败，已自动禁用NN加速: "
+                  << e.what_without_backtrace() << std::endl;
+    }
+}
+
+void Inamuro::setUseNeuralNetwork(bool enable)
+{
+    use_neural_network = enable;
+}
+
+void Inamuro::setUseGpuInference(bool enable)
+{
+    use_gpu_inference = enable && torch::cuda::is_available();
+}
+
+bool Inamuro::isModelLoaded() const
+{
+    return model_loaded;
+}
+
+bool Inamuro::isUsingNeuralNetwork() const
+{
+    return use_neural_network;
+}
+
+bool Inamuro::isUsingGpuInference() const
+{
+    return use_gpu_inference;
+}
+
+const Inamuro::PressureSolveDiagnostics& Inamuro::getLastPressureSolveDiagnostics() const
+{
+    return last_pressure_solve_diagnostics;
+}
+
 Inamuro::DiagnosticsSnapshot Inamuro::collectDiagnostics() const
 {
     DiagnosticsSnapshot snapshot;
@@ -498,6 +568,111 @@ Inamuro::DiagnosticsSnapshot Inamuro::collectDiagnostics() const
     finalizeFieldStatistics(snapshot.p_stats, p_valid, p_sum);
 
     return snapshot;
+}
+
+Inamuro::Vector3D Inamuro::predictPressureDelta(const Vector3D& pressure_prev)
+{
+    Vector3D delta_p;
+    resize3D(delta_p, lx, ly, lz, 0.0);
+
+    if (!model_loaded)
+    {
+        return delta_p;
+    }
+
+    std::vector<float> input_data(static_cast<std::size_t>(6) * lx * ly * lz, 0.0f);
+
+    auto write_channel = [&](int channel, int x, int y, int z, double value)
+    {
+        const std::size_t spatial_idx =
+            static_cast<std::size_t>(x) * ly * lz +
+            static_cast<std::size_t>(y) * lz +
+            static_cast<std::size_t>(z);
+        const std::size_t idx = static_cast<std::size_t>(channel) * lx * ly * lz + spatial_idx;
+        input_data[idx] = static_cast<float>((value - input_means[channel]) / input_stds[channel]);
+    };
+
+    for (int x = 0; x < lx; ++x)
+    {
+        for (int y = 0; y < ly; ++y)
+        {
+            for (int z = 0; z < lz; ++z)
+            {
+                write_channel(0, x, y, z, rho[x][y][z + 1]);
+                write_channel(1, x, y, z, u[x][y][z + 1]);
+                write_channel(2, x, y, z, v[x][y][z + 1]);
+                write_channel(3, x, y, z, w[x][y][z + 1]);
+                write_channel(4, x, y, z, fei[x][y][z + 1]);
+                write_channel(5, x, y, z, pressure_prev[x][y][z]);
+            }
+        }
+    }
+
+    torch::NoGradGuard no_grad;
+    auto input_tensor = torch::from_blob(input_data.data(), {1, 6, lx, ly, lz}, torch::kFloat32).clone();
+    if (use_gpu_inference)
+    {
+        input_tensor = input_tensor.to(torch::kCUDA);
+    }
+    std::vector<torch::jit::IValue> inputs;
+    inputs.emplace_back(input_tensor);
+
+    auto output_tensor = model.forward(inputs).toTensor();
+    if (use_gpu_inference)
+    {
+        if (!output_tensor.is_cuda())
+        {
+            throw std::runtime_error("配置要求 GPU 推理，但模型输出不在 CUDA 上");
+        }
+        if (!input_tensor.is_cuda())
+        {
+            throw std::runtime_error("配置要求 GPU 推理，但输入张量不在 CUDA 上");
+        }
+        std::cout << "[NNInference] input_device=" << input_tensor.device()
+                  << " output_device=" << output_tensor.device() << std::endl;
+        output_tensor = output_tensor.to(torch::kCPU);
+    }
+    auto output = output_tensor.contiguous();
+    const float* output_ptr = output.data_ptr<float>();
+
+    for (int x = 0; x < lx; ++x)
+    {
+        for (int y = 0; y < ly; ++y)
+        {
+            for (int z = 0; z < lz; ++z)
+            {
+                const std::size_t idx =
+                    static_cast<std::size_t>(x) * ly * lz +
+                    static_cast<std::size_t>(y) * lz +
+                    static_cast<std::size_t>(z);
+                delta_p[x][y][z] = static_cast<double>(output_ptr[idx]) * output_std + output_mean;
+            }
+        }
+    }
+
+    return delta_p;
+}
+
+void Inamuro::initializePressureFromPrediction(const Vector3D& predicted_pressure)
+{
+    // 最小恢复版先使用最直接的初始化方式：
+    // 1. 将预测压力写入宏观压力数组 p
+    // 2. 用 hh = Ei * p 初始化压力分布函数
+    // 这样可以先验证 NN 初值是否有效，再单独检查是否需要更严格的一致性重建。
+    for (int x = 0; x < lx; ++x)
+    {
+        for (int y = 0; y < ly; ++y)
+        {
+            for (int z = 0; z < lz; ++z)
+            {
+                p[x][y][z + 1] = predicted_pressure[x][y][z];
+                for (int i = 0; i < D3Q15::Q; ++i)
+                {
+                    hh[i][x][y][z] = D3Q15::Ei[i] * p[x][y][z + 1];
+                }
+            }
+        }
+    }
 }
 
 // === 算法实现方法 ===
@@ -620,6 +795,7 @@ void Inamuro::solvePressurePoisson()
     // 压力误差缓存（对应pp数组）
     static Vector3D pressure_prev;
     static bool first_call = true;
+    ++pressure_solve_call_count;
 
     // 第一次调用时初始化压力缓存
     if (first_call)
@@ -628,9 +804,65 @@ void Inamuro::solvePressurePoisson()
         first_call = false;
     }
 
+    const auto pressure_solve_start = std::chrono::steady_clock::now();
+
+    // v3 训练数据从 Step 11 开始，前 10 步属于极端动态阶段，直接禁用 NN。
+    // 从第 11 次压力求解开始，再按“上一步泊松迭代次数”决定是否启用 NN。
+    const bool passed_warmup_stage = pressure_solve_call_count > NN_WARMUP_STEPS;
+    const int prev_iteration_count = last_iteration_count;
+    const bool nn_temporarily_disabled = nn_disable_countdown > 0;
+    const bool use_nn_this_step =
+        passed_warmup_stage &&
+        use_neural_network &&
+        model_loaded &&
+        !nn_temporarily_disabled &&
+        (prev_iteration_count > NN_ITER_THRESHOLD_STRICT);
+
+    last_pressure_solve_diagnostics.pressure_solve_call_count = pressure_solve_call_count;
+    last_pressure_solve_diagnostics.passed_warmup_stage = passed_warmup_stage;
+    last_pressure_solve_diagnostics.nn_used = use_nn_this_step;
+    last_pressure_solve_diagnostics.prev_iteration_count = prev_iteration_count;
+    last_pressure_solve_diagnostics.iteration_count = 0;
+    last_pressure_solve_diagnostics.hit_max_iterations = false;
+    last_pressure_solve_diagnostics.pressure_solve_time_ms = 0.0;
+    last_pressure_solve_diagnostics.nn_prediction_time_ms = 0.0;
+
+    std::cout << "[PressureSolve] 调用=" << pressure_solve_call_count
+              << " 上一步迭代数=" << prev_iteration_count
+              << " 已过前10步=" << (passed_warmup_stage ? "是" : "否")
+              << " 冷却中=" << (nn_temporarily_disabled ? "是" : "否")
+              << " 使用NN=" << (use_nn_this_step ? "是" : "否") << std::endl;
+
+    if (use_nn_this_step)
+    {
+        const auto nn_start = std::chrono::steady_clock::now();
+        const Vector3D delta_p = predictPressureDelta(pressure_prev);
+        Vector3D predicted_pressure;
+        resize3D(predicted_pressure, lx, ly, lz, 0.0);
+
+        for (int x = 0; x < lx; ++x)
+        {
+            for (int y = 0; y < ly; ++y)
+            {
+                for (int z = 0; z < lz; ++z)
+                {
+                    predicted_pressure[x][y][z] = pressure_prev[x][y][z] + delta_p[x][y][z];
+                }
+            }
+        }
+
+        initializePressureFromPrediction(predicted_pressure);
+        const auto nn_end = std::chrono::steady_clock::now();
+        last_pressure_solve_diagnostics.nn_prediction_time_ms =
+            std::chrono::duration_cast<std::chrono::microseconds>(nn_end - nn_start).count() / 1000.0;
+    }
+
     // 压力泊松方程迭代求解
+    int iteration_count = 0;
+    const int convergence_check_interval = use_nn_this_step ? 50 : 100;
     for (int i_iter = 1; i_iter <= 1000; ++i_iter)
     {
+        iteration_count = i_iter;
         // 压力修正（对应correction()）
         collision_p();
 
@@ -641,8 +873,8 @@ void Inamuro::solvePressurePoisson()
         // 计算压力场（对应getp()）
         getp();
 
-        // 每100步检查收敛性
-        if (i_iter % 100 == 0)
+        // 每固定步数检查收敛性
+        if (i_iter % convergence_check_interval == 0)
         {
             double error = getError(pressure_prev);
             if (error < 0.001)
@@ -653,6 +885,21 @@ void Inamuro::solvePressurePoisson()
             }
         }
     }
+
+    last_iteration_count = iteration_count;
+    if (nn_disable_countdown > 0)
+    {
+        --nn_disable_countdown;
+    }
+    if (use_nn_this_step && NN_DISABLE_COOLDOWN_STEPS > 0 && iteration_count >= prev_iteration_count)
+    {
+        nn_disable_countdown = NN_DISABLE_COOLDOWN_STEPS;
+    }
+    last_pressure_solve_diagnostics.iteration_count = iteration_count;
+    last_pressure_solve_diagnostics.hit_max_iterations = (iteration_count >= 1000);
+    const auto pressure_solve_end = std::chrono::steady_clock::now();
+    last_pressure_solve_diagnostics.pressure_solve_time_ms =
+        std::chrono::duration_cast<std::chrono::microseconds>(pressure_solve_end - pressure_solve_start).count() / 1000.0;
 }
 
 double Inamuro::getError(Vector3D& pressure_prev)

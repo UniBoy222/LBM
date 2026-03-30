@@ -2,9 +2,12 @@
 
 #include "LBMBase.hpp"
 #include "common.hpp"
+#include <chrono>
 #include <fstream>
 #include <limits>
 #include <string>
+#include <torch/script.h>
+#include <torch/torch.h>
 #include <vector>
 
 /**
@@ -66,6 +69,46 @@ protected:
     };
     Parameters params;
 
+    // === 神经网络相关（最小恢复版） ===
+    // 只恢复 v3 Δp 模型接入必需的状态：
+    // 1. 是否启用 NN
+    // 2. TorchScript 模型是否成功加载
+    // 3. 上一步压力泊松迭代次数（用于自适应切换）
+    bool use_neural_network = true;
+    bool use_gpu_inference = false;
+    torch::jit::script::Module model;
+    bool model_loaded = false;
+    int last_iteration_count = 1000;
+    int pressure_solve_call_count = 0;
+    int nn_disable_countdown = 0;
+    static constexpr int NN_WARMUP_STEPS = 10;
+
+    // v3 训练时使用的 6 通道 z-score 归一化参数。
+    // 输入：[rho, u, v, w, phi, p_prev]
+    // 输出：Δp = p_current - p_prev
+    const std::vector<double> input_means = {2.51422158, -0.00001289, 0.0, 0.0, 0.01392343, -0.02551287};
+    const std::vector<double> input_stds = {8.23543629, 0.00389878, 0.00401780, 0.00503228, 0.01414641, 0.00920020};
+    const double output_mean = -8.3591e-06;
+    const double output_std = 1.3666e-04;
+    static constexpr int NN_ITER_THRESHOLD = 100;
+    static constexpr int NN_ITER_THRESHOLD_STRICT = 30;
+    static constexpr int NN_DISABLE_COOLDOWN_STEPS = 3;
+
+public:
+    struct PressureSolveDiagnostics
+    {
+        int pressure_solve_call_count = 0;
+        bool passed_warmup_stage = false;
+        bool nn_used = false;
+        int prev_iteration_count = 0;
+        int iteration_count = 0;
+        bool hit_max_iterations = false;
+        double pressure_solve_time_ms = 0.0;
+        double nn_prediction_time_ms = 0.0;
+    };
+
+    PressureSolveDiagnostics last_pressure_solve_diagnostics{};
+
 public:
     // 单个场的统计量。
     // 这里不存方差，只保留排查数值爆炸最直接有用的指标：
@@ -105,6 +148,8 @@ public:
         std::string summary_filename = "step_diagnostics.csv";
     };
 
+public:
+
     // === 构造函数重载 ===
     explicit Inamuro(int nx = 48, int ny = 96, int nz = 128); // 默认网格尺寸构造函数
     explicit Inamuro(const std::string& filename);   // 从文件读取所有参数构造函数
@@ -124,6 +169,13 @@ public:
     void setOutputConfig(const OutputConfig& config);
     const OutputConfig& getOutputConfig() const;
     DiagnosticsSnapshot collectDiagnostics() const;
+    void loadNeuralNetwork(const std::string& model_path);
+    void setUseNeuralNetwork(bool enable);
+    void setUseGpuInference(bool enable);
+    bool isModelLoaded() const;
+    bool isUsingNeuralNetwork() const;
+    bool isUsingGpuInference() const;
+    const PressureSolveDiagnostics& getLastPressureSolveDiagnostics() const;
 
 private:
     template <typename T>
@@ -159,6 +211,8 @@ private:
     // 压力泊松方程
     void solvePressurePoisson(); // 求解压力泊松方程
     double getError(Vector3D& pressure_prev); // 获取压力误差
+    Vector3D predictPressureDelta(const Vector3D& pressure_prev);
+    void initializePressureFromPrediction(const Vector3D& predicted_pressure);
 
     void collision_p(); // 碰撞压力
     void getp(); // 获取压力
@@ -186,7 +240,7 @@ private:
     static void finalizeFieldStatistics(FieldStatistics& stats, std::size_t valid_count, double accumulator);
 
     // === 输出配置 ===
-    OutputConfig output_config;
+    OutputConfig output_config{};
 };
 // 求导模板函数实现
 template <typename T>

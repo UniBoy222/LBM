@@ -1,7 +1,7 @@
 48 96 128
 1
 8000
-10
+100
 50.0 1.0
 1.0 1.0
 0.008 0.00016
@@ -23,9 +23,10 @@
 # ===============================
 enable_timing=1               # 是否在终端输出总耗时、平均每步耗时
 enable_progress=1             # 是否在终端显示当前进度和预计剩余时间
-enable_tecplot_output=0       # 是否按 output_frequency 生成 Tecplot 二进制结果文件
+enable_tecplot_output=1       # 是否按 output_frequency 生成 Tecplot 二进制结果文件
 enable_debug_field_csv=0      # 是否按 output_frequency 生成整场 CSV；文件很大，通常只在小规模调试时开启
 enable_step_summary_csv=1     # 是否每一步都生成一条场统计摘要，写入 step_diagnostics.csv
 enable_basic_warnings=1       # 是否在终端提示两类基础异常：首次出现负密度、首次出现 NaN/Inf
+enable_nn_pressure_init=1     # 是否启用 NN 压力初始化；设为 0 可直接跑基线对照
 output_dir=out/               # 输出目录；所有诊断文件和结果文件都会写到这里
 step_summary_filename=step_diagnostics.csv  # 每步统计摘要文件名

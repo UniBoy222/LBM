@@ -5,6 +5,21 @@
 #include <iostream>
 #include <sstream>
 
+namespace
+{
+std::string trimCopy(const std::string& text)
+{
+    const std::size_t first = text.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos)
+    {
+        return "";
+    }
+
+    const std::size_t last = text.find_last_not_of(" \t\r\n");
+    return text.substr(first, last - first + 1);
+}
+} // namespace
+
 // 构造函数：
 // 1. 先构造 Inamuro，完成数组和初始液滴初始化
 // 2. 再读取求解器自己的配置（步数、输出频率、日志开关）
@@ -25,6 +40,17 @@ InamuroSolver::InamuroSolver(const std::string& filename)
     loadConfiguration(filename);
     applyOutputConfiguration();
     openDiagnosticsFile();
+
+    // 启动时默认尝试加载稳定的 v3 TorchScript 主模型。
+    // 如果模型或 libtorch 环境异常，Inamuro 内部会自动禁用 NN，不影响基线求解继续运行。
+    inamuro->setUseGpuInference(solver_config.enable_gpu_inference);
+    inamuro->loadNeuralNetwork("training/checkpoints_dp/best_model_jit.pth");
+    inamuro->setUseNeuralNetwork(solver_config.enable_nn_pressure_init);
+}
+
+InamuroSolver::~InamuroSolver()
+{
+    releaseDiagnosticsLock();
 }
 
 void InamuroSolver::setSolverConfig(const SolverConfig& config)
@@ -68,16 +94,16 @@ void InamuroSolver::run() // 运行求解器
         // 执行一个时间步
         inamuro->performTimeStep();
 
+        // 计算本步耗时
+        auto step_end = std::chrono::steady_clock::now();
+        last_step_time_ms = std::chrono::duration_cast<std::chrono::microseconds>(step_end - step_start).count() / 1000.0;
+
         // 一步结束后，把整个场的统计量落盘。
         // 这个文件是排查数值爆炸最核心的日志之一。
         recordStepDiagnostics(current_time_step + 1);
 
-        // 计算本步耗时
-        auto step_end = std::chrono::steady_clock::now();
-        double step_ms = std::chrono::duration_cast<std::chrono::microseconds>(step_end - step_start).count() / 1000.0;
-
         // 累加时间（所有计算步骤都计入平均）
-        total_step_time_ms += step_ms;
+        total_step_time_ms += last_step_time_ms;
 
         // 计算步骤编号：current_time_step + 1
         int computation_step = current_time_step + 1;
@@ -85,7 +111,7 @@ void InamuroSolver::run() // 运行求解器
 
         std::cout << "  → 第 " << std::setw(3) << computation_step
                   << " 步计算完成 | 耗时: " << std::fixed << std::setprecision(2)
-                  << step_ms << " ms | 平均: " << avg_ms << " ms/步" << std::endl;
+                  << last_step_time_ms << " ms | 平均: " << avg_ms << " ms/步" << std::endl;
         std::cout << std::flush;
     }
 
@@ -122,7 +148,14 @@ void InamuroSolver::loadConfiguration(const std::string& filename) // 加载配�
 
     while (std::getline(file, line))
     {
-        if (line.empty() || line[0] == '#')
+        const std::size_t comment_pos = line.find('#');
+        if (comment_pos != std::string::npos)
+        {
+            line = line.substr(0, comment_pos);
+        }
+
+        line = trimCopy(line);
+        if (line.empty())
         {
             continue;
         }
@@ -133,23 +166,16 @@ void InamuroSolver::loadConfiguration(const std::string& filename) // 加载配�
             continue;
         }
 
-        std::string key = line.substr(0, pos);
+        std::string key = trimCopy(line.substr(0, pos));
         std::string value = line.substr(pos + 1);
 
-        // 去除value中的行内注释（'#'及其后面的内容）
+        // 去除 value 中的行内注释（'#' 及其后面的内容）
         const std::size_t comment_pos = value.find('#');
         if (comment_pos != std::string::npos)
         {
             value = value.substr(0, comment_pos);
         }
-
-        // 去除key和value的前后空白字符
-        auto trim = [](std::string& s) {
-            s.erase(0, s.find_first_not_of(" \t\r\n"));
-            s.erase(s.find_last_not_of(" \t\r\n") + 1);
-        };
-        trim(key);
-        trim(value);
+        value = trimCopy(value);
 
         parseOptionalSetting(key, value);
     }
@@ -188,6 +214,14 @@ void InamuroSolver::parseOptionalSetting(const std::string& key, const std::stri
     {
         solver_config.enable_basic_warnings = to_bool(value);
     }
+    else if (key == "enable_nn_pressure_init")
+    {
+        solver_config.enable_nn_pressure_init = to_bool(value);
+    }
+    else if (key == "enable_gpu_inference")
+    {
+        solver_config.enable_gpu_inference = to_bool(value);
+    }
     else if (key == "output_dir")
     {
         solver_config.output_dir = value;
@@ -223,10 +257,23 @@ void InamuroSolver::openDiagnosticsFile()
     const std::filesystem::path diagnostics_path =
         std::filesystem::path(solver_config.output_dir) / solver_config.step_summary_filename;
 
+    diagnostics_lock_dir = diagnostics_path;
+    diagnostics_lock_dir += ".lock";
+
+    std::error_code ec;
+    if (!std::filesystem::create_directory(diagnostics_lock_dir, ec))
+    {
+        std::cerr << "警告: 诊断文件 " << diagnostics_path
+                  << " 已被另一个仿真进程占用，当前进程将关闭 step_diagnostics.csv 写入。" << std::endl;
+        diagnostics_lock_dir.clear();
+        return;
+    }
+
     diagnostics_stream.open(diagnostics_path, std::ios::out | std::ios::trunc);
     if (!diagnostics_stream)
     {
         std::cerr << "警告: 无法打开诊断文件 " << diagnostics_path << std::endl;
+        releaseDiagnosticsLock();
         return;
     }
 
@@ -243,6 +290,7 @@ void InamuroSolver::writeDiagnosticsHeader()
 
     diagnostics_stream
         << "time_step"
+        << ",step_time_ms,pressure_solve_call_count,nn_warmup_passed,nn_used,prev_pressure_iterations,pressure_iterations,pressure_hit_max_iter,pressure_solve_ms,nn_prediction_ms"
         << ",rho_min,rho_max,rho_mean,rho_abs_max,rho_nan_count,rho_inf_count"
         << ",fei_min,fei_max,fei_mean,fei_abs_max,fei_nan_count,fei_inf_count"
         << ",u_min,u_max,u_mean,u_abs_max,u_nan_count,u_inf_count"
@@ -261,6 +309,7 @@ void InamuroSolver::recordStepDiagnostics(int timeStep)
     }
 
     const Inamuro::DiagnosticsSnapshot snapshot = inamuro->collectDiagnostics();
+    const Inamuro::PressureSolveDiagnostics pressure_diag = inamuro->getLastPressureSolveDiagnostics();
     const auto write_stats = [this](const Inamuro::FieldStatistics& stats)
     {
         diagnostics_stream
@@ -273,6 +322,49 @@ void InamuroSolver::recordStepDiagnostics(int timeStep)
     };
 
     diagnostics_stream << timeStep;
+    if (timeStep == 0)
+    {
+        diagnostics_stream
+            << ",0,0,0,0,0,0,0,0,0";
+    }
+    else
+    {
+        diagnostics_stream
+            << "," << last_step_time_ms
+            << "," << pressure_diag.pressure_solve_call_count
+            << "," << (pressure_diag.passed_warmup_stage ? 1 : 0)
+            << "," << (pressure_diag.nn_used ? 1 : 0)
+            << "," << pressure_diag.prev_iteration_count
+            << "," << pressure_diag.iteration_count
+            << "," << (pressure_diag.hit_max_iterations ? 1 : 0)
+            << "," << pressure_diag.pressure_solve_time_ms
+            << "," << pressure_diag.nn_prediction_time_ms;
+
+        if (pressure_diag.nn_used)
+        {
+            ++nn_used_steps;
+            nn_used_iteration_sum += pressure_diag.iteration_count;
+            ++nn_used_iteration_samples;
+            if (first_nn_used_step < 0)
+            {
+                first_nn_used_step = timeStep;
+            }
+            last_nn_used_step = timeStep;
+            if (timeStep <= 200)
+            {
+                ++nn_used_steps_first_200;
+            }
+            else
+            {
+                ++nn_used_steps_after_200;
+            }
+        }
+        else
+        {
+            nn_not_used_iteration_sum += pressure_diag.iteration_count;
+            ++nn_not_used_iteration_samples;
+        }
+    }
     write_stats(snapshot.rho_stats);
     write_stats(snapshot.fei_stats);
     write_stats(snapshot.u_stats);
@@ -335,6 +427,9 @@ void InamuroSolver::printSimulationHeader() const // 打印模拟头
     std::cout << "整场CSV输出: " << (solver_config.enable_debug_field_csv ? "开启" : "关闭") << std::endl;
     std::cout << "每步诊断摘要: " << (solver_config.enable_step_summary_csv ? "开启" : "关闭") << std::endl;
     std::cout << "基础告警: " << (solver_config.enable_basic_warnings ? "开启" : "关闭") << std::endl;
+    std::cout << "NN压力初始化: " << (inamuro->isUsingNeuralNetwork() ? "开启" : "关闭") << std::endl;
+    std::cout << "NN推理设备: " << (inamuro->isUsingGpuInference() ? "GPU" : "CPU") << std::endl;
+    std::cout << "模型加载状态: " << (inamuro->isModelLoaded() ? "成功" : "失败") << std::endl;
     std::cout << std::string(50, '-') << std::endl;
 }
 
@@ -387,9 +482,48 @@ void InamuroSolver::printElapsedTime() const // 打印耗时
         std::cout << "平均时间/步: " << std::fixed << std::setprecision(2)
                   << (total_step_time_ms / max_time_steps) << " ms" << std::endl;
     }
+
+    const double nn_used_fraction = (max_time_steps > 0)
+        ? (100.0 * static_cast<double>(nn_used_steps) / static_cast<double>(max_time_steps))
+        : 0.0;
+    const double avg_iter_when_nn = (nn_used_iteration_samples > 0)
+        ? (nn_used_iteration_sum / nn_used_iteration_samples)
+        : 0.0;
+    const double avg_iter_without_nn = (nn_not_used_iteration_samples > 0)
+        ? (nn_not_used_iteration_sum / nn_not_used_iteration_samples)
+        : 0.0;
+
+    std::cout << "NN使用步数: " << nn_used_steps << "/" << max_time_steps
+              << " (" << std::fixed << std::setprecision(2) << nn_used_fraction << "%)" << std::endl;
+    if (first_nn_used_step >= 0)
+    {
+        std::cout << "NN首次使用步: " << first_nn_used_step
+                  << "，最后使用步: " << last_nn_used_step << std::endl;
+    }
+    else
+    {
+        std::cout << "NN首次使用步: 无，最后使用步: 无" << std::endl;
+    }
+
+    std::cout << "前200步中NN使用次数: " << nn_used_steps_first_200 << std::endl;
+    std::cout << "200步后NN使用次数: " << nn_used_steps_after_200 << std::endl;
+    std::cout << "使用NN时平均压力迭代数: " << std::fixed << std::setprecision(2)
+              << avg_iter_when_nn << std::endl;
+    std::cout << "未使用NN时平均压力迭代数: " << std::fixed << std::setprecision(2)
+              << avg_iter_without_nn << std::endl;
 }
 
 double InamuroSolver::getElapsedSeconds() const // 获取耗时（已废弃，保留接口兼容性）
 {
     return total_step_time_ms / 1000.0;
+}
+
+void InamuroSolver::releaseDiagnosticsLock()
+{
+    if (!diagnostics_lock_dir.empty())
+    {
+        std::error_code ec;
+        std::filesystem::remove(diagnostics_lock_dir, ec);
+        diagnostics_lock_dir.clear();
+    }
 }

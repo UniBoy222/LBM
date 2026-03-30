@@ -1,12 +1,12 @@
 #include "InamuroSolver.hpp"
 #include <iostream>
 
-int main()
+int main(int argc, char* argv[])
 {
     try
     {
         // 创建求解器（使用文件构造函数）
-        InamuroSolver solver("params.in");
+        InamuroSolver solver(argc > 1 ? argv[1] : "params.in");
 
         // 运行仿真
         solver.run();

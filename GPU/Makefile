@@ -16,7 +16,7 @@ LDFLAGS :=
 
 # 源文件
 GPU_SRC := InamuroCUDA.cu
-CPU_SRC := ../CPU/Inamuro.cpp ../CPU/InamuroSolver.cpp ../CPU/common.cpp
+CPP_SRC := Inamuro.cpp InamuroSolver.cpp common.cpp
 
 # 目标程序
 TARGET_GPU := lbm_gpu
@@ -41,9 +41,9 @@ compare: $(TARGET_COMPARE)
 # ========================================================
 
 # GPU独立版本
-$(TARGET_GPU): $(GPU_SRC) $(CPU_SRC) main.cpp
+$(TARGET_GPU): $(GPU_SRC) $(CPP_SRC) main.cpp
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) \
-		$(GPU_SRC) $(CPU_SRC) main.cpp \
+		$(GPU_SRC) $(CPP_SRC) main.cpp \
 		-o $@ $(LDFLAGS)
 	@echo ""
 	@echo "✅ GPU version compiled successfully!"
@@ -52,9 +52,9 @@ $(TARGET_GPU): $(GPU_SRC) $(CPU_SRC) main.cpp
 	@echo ""
 
 # GPU vs CPU对比测试
-$(TARGET_COMPARE): $(GPU_SRC) $(CPU_SRC) compare_test.cpp
+$(TARGET_COMPARE): $(GPU_SRC) $(CPP_SRC) compare_test.cpp
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) \
-		$(GPU_SRC) $(CPU_SRC) compare_test.cpp \
+		$(GPU_SRC) $(CPP_SRC) compare_test.cpp \
 		-o $@ $(LDFLAGS)
 	@echo ""
 	@echo "✅ Comparison test compiled successfully!"
