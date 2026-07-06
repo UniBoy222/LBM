@@ -32,6 +32,29 @@ public:
     // 将 GPU 上的宏观量下载回 CPU Inamuro（用于输出/对比）
     void downloadFieldsToCPU(Inamuro& cpuSolver) const;
 
+    // 性能与roofline证据输出
+    void setUseFusedPoisson(bool enabled);
+    void setUseOnePassPoisson(bool enabled);
+    void setUseScalarPoisson(bool enabled);
+    void setScalarPoissonSourceScale(double scale);
+    void setUseSourceAwareHHInit(bool enabled);
+    void setSourceAwareHHScale(double scale);
+    void setPressureRelaxScale(double scale);
+    void setPoissonFixedPointRelax(double omega);
+    void setUsePoissonAndersonM1(bool enabled);
+    void setPoissonAndersonBetaMax(double value);
+    void setUsePoissonTwoGridCorrection(bool enabled);
+    void setPoissonTwoGridStrength(double value);
+    void setUseFusedBoundaryPressure(bool enabled);
+    void setUsePoissonGraph(bool enabled);
+    void setEnablePoissonDetailTiming(bool enabled);
+    void setPoissonConvergence(int check_interval, double tolerance);
+    void setPoissonDiagnosticsPath(const std::string& path);
+    void setUsePoissonSpatialDiagnostics(bool enabled);
+    void printPerformanceMetrics() const;
+    void printRooflineSummary() const;
+    void resetPerformanceMetrics();
+
 private:
     // ------------ 网格与布局 ------------
     const Inamuro& cpu;       // 仅引用，不拥有
@@ -59,11 +82,52 @@ private:
         double total_stream_time = 0.0;      // 迁移kernel总时间(ms)
         double total_macro_time = 0.0;       // 宏观量kernel总时间(ms)
         double total_poisson_time = 0.0;     // 压力泊松总时间(ms)
+        double poisson_collision_time = 0.0;
+        double poisson_stream_time = 0.0;
+        double poisson_fused_time = 0.0;
+        double poisson_onepass_time = 0.0;
+        double poisson_scalar_time = 0.0;
+        double poisson_init_time = 0.0;
+        double poisson_boundary_time = 0.0;
+        double poisson_pressure_time = 0.0;
+        double poisson_boundary_pressure_time = 0.0;
+        double poisson_residual_time = 0.0;
+        int total_poisson_iterations = 0;    // 压力泊松总迭代次数
         int time_step_count = 0;             // 时间步计数
     } perf;
     
     bool enable_timing = true;      // 是否启用性能测量
     bool enable_debug = false;      // 是否启用DEBUG输出
+    bool use_fused_poisson = false; // 是否启用压力碰撞+迁移融合算子
+    bool use_onepass_poisson = false;
+    bool use_scalar_poisson = false;
+    bool use_source_aware_hh_init = false;
+    bool use_fused_boundary_pressure = false;
+    bool use_poisson_graph = false;
+    bool use_poisson_anderson_m1 = false;
+    bool use_poisson_spatial_diagnostics = false;
+    bool use_poisson_two_grid_correction = false;
+    bool enable_poisson_detail_timing = false;
+    int poisson_check_interval = 100;
+    double poisson_tolerance = 0.001;
+    double scalar_poisson_source_scale = 2.0;
+    double source_aware_hh_scale = 1.0;
+    double pressure_relax_scale = 1.0;
+    double poisson_fixed_point_relax = 1.0;
+    double poisson_anderson_beta_max = 1.0;
+    double poisson_two_grid_strength = 0.5;
+    std::string poisson_diagnostics_path;
+
+    cudaGraph_t poisson_graph = nullptr;
+    cudaGraphExec_t poisson_graph_exec = nullptr;
+    int poisson_graph_check_interval = 0;
+
+    void destroyPoissonGraph();
+    void buildPoissonGraphSegment();
+    void writePoissonDiagnostic(int step, int iteration, double pressure_l1_delta,
+                                double pressure_l1_norm, double relative_error,
+                                bool converged, double block_low_frequency_fraction,
+                                int block_size, int block_count) const;
 
     // ------------ 设备端字段 ------------
     struct GPUMemory
@@ -72,6 +136,9 @@ private:
         double* d_ff = nullptr;
         double* d_gg = nullptr;
         double* d_hh = nullptr;
+        double* d_ff_tmp = nullptr;
+        double* d_gg_tmp = nullptr;
+        double* d_hh_tmp = nullptr;
 
         // 宏观量 [N_macro]（带 z 方向 ghost）
         double* d_rho = nullptr;
@@ -80,6 +147,7 @@ private:
         double* d_v   = nullptr;
         double* d_w   = nullptr;
         double* d_p   = nullptr;
+        double* d_p_tmp = nullptr;
 
         // 梯度/拉普拉斯（仅物理域，后续逐步填充）
         double* d_fei_x = nullptr; double* d_fei_y = nullptr; double* d_fei_z = nullptr;
@@ -90,6 +158,14 @@ private:
 
         double* d_fei_lap = nullptr;
         double* d_u_lap   = nullptr; double* d_v_lap = nullptr; double* d_w_lap = nullptr;
+
+        double* d_p_prev = nullptr;
+        double* d_pressure_error = nullptr;
+        double* d_anderson_prev_residual = nullptr;
+        double* d_anderson_prev_image = nullptr;
+        double* d_anderson_stats = nullptr;
+        double* d_pressure_block_sums = nullptr;
+        double* d_pressure_block_error = nullptr;
     } gpu;
 
     // ------------ 内部帮助函数 ------------
@@ -113,10 +189,6 @@ private:
     void doPressurePoisson();          // 压力泊松求解（对应CPU的solvePressurePoisson）
     void doCorrectUVWAndHH();          // 速度修正+hh更新（对应CPU的correct_uvw+update_hh）
     
-    // 性能测量辅助函数
-    void printPerformanceMetrics() const;
-    void resetPerformanceMetrics();
-
     // ------------ 内联索引（cell-major / Q-minor） ------------
     static __host__ __device__ inline
     int idx3D(int x, int y, int z, int lx, int ly, int lz_tot) {

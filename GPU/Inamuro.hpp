@@ -52,6 +52,17 @@ protected:
         // === 物理几何参数 ===
         double DD = 32.0; // 液滴直径
 
+        // === 初始条件参数 ===
+        std::string init_mode = "two_droplets"; // two_droplets 或 single_droplet
+        std::string init_profile = "sharp";     // sharp 或 tanh
+        double init_velocity = 0.035;
+        double interface_width = 2.0;
+        double init_center_x = -1.0;
+        double init_center_y = -1.0;
+        double init_center_z = -1.0;
+        double init_separation = -1.0;
+        double init_offset_x = 0.0;
+
         // === 状态方程参数 ===
         double T = 0.035, a = 1.0, b = 6.7; // van der Waals EOS参数
 

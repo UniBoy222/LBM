@@ -5,6 +5,7 @@
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <string>
 #include <utility>
 
 // =========================================
@@ -49,6 +50,54 @@ Inamuro::Parameters::Parameters(const std::string& filename)
         file >> fei_L >> fei_G;     // 第13行: 相场值
         file >> DD;                 // 第14行: 液滴直径
 
+        std::string token;
+        while (file >> token)
+        {
+            const std::size_t pos = token.find('=');
+            if (pos == std::string::npos)
+            {
+                continue;
+            }
+            const std::string key = token.substr(0, pos);
+            const std::string value = token.substr(pos + 1);
+            if (key == "init_mode")
+            {
+                init_mode = value;
+            }
+            else if (key == "init_profile")
+            {
+                init_profile = value;
+            }
+            else if (key == "init_velocity")
+            {
+                init_velocity = std::stod(value);
+            }
+            else if (key == "interface_width")
+            {
+                interface_width = std::stod(value);
+            }
+            else if (key == "init_center_x")
+            {
+                init_center_x = std::stod(value);
+            }
+            else if (key == "init_center_y")
+            {
+                init_center_y = std::stod(value);
+            }
+            else if (key == "init_center_z")
+            {
+                init_center_z = std::stod(value);
+            }
+            else if (key == "init_separation")
+            {
+                init_separation = std::stod(value);
+            }
+            else if (key == "init_offset_x")
+            {
+                init_offset_x = std::stod(value);
+            }
+        }
+
         file.close();
         std::cout << "Inamuro参数读取成功!" << std::endl;
         update_gam();
@@ -83,6 +132,15 @@ void Inamuro::Parameters::print() const
     std::cout << "  表面张力系数: k_f=" << k_f << ", k_g=" << k_g << std::endl;
     std::cout << "物理几何:" << std::endl;
     std::cout << "  液滴直径: DD=" << DD << std::endl;
+    std::cout << "初始条件:" << std::endl;
+    std::cout << "  init_mode=" << init_mode
+              << ", init_profile=" << init_profile
+              << ", init_velocity=" << init_velocity
+              << ", interface_width=" << interface_width
+              << ", init_center=(" << init_center_x << ", "
+              << init_center_y << ", " << init_center_z << ")"
+              << ", init_separation=" << init_separation
+              << ", init_offset_x=" << init_offset_x << std::endl;
     std::cout << "状态方程:" << std::endl;
     std::cout << "  EOS参数: T=" << T << ", a=" << a << ", b=" << b << std::endl;
     std::cout << "========================" << std::endl;
@@ -430,40 +488,78 @@ void Inamuro::initializeArrays()
 void Inamuro::initializeDroplets()
 {
     double radius = params.DD / 2.0;   // 液滴半径
-    double cy = ly / 2.0;              // Y中心
-    double cz1 = lz / 2.0 + params.DD; // 液滴1的Z位置
-    double cz2 = lz / 2.0 - params.DD; // 液滴2的Z位置
-    double velocity = 0.035;           // 初始速度
+    const double cy_default = ly / 2.0;
+    const double cz_default = lz / 2.0;
+    const bool use_tanh_profile = (params.init_profile == "tanh");
+    const double interface_width = (params.interface_width > 0.0) ? params.interface_width : 2.0;
 
-    for (int x = 0; x < lx; ++x)
+    auto place_droplet = [&](double cx, double cy, double cz, double vz)
     {
-        for (int y = 0; y < ly; ++y)
+        for (int x = 0; x < lx; ++x)
         {
-            for (int z = 1; z < lz + 1; ++z) // 不初始化虚拟层 1~lz
+            for (int y = 0; y < ly; ++y)
             {
-                double dx = x, dy = y - cy;
-                double dz1 = (z - 1) - cz1, dz2 = (z - 1) - cz2;
-                double r1 = std::sqrt(dx * dx + dy * dy + dz1 * dz1);
-                double r2 = std::sqrt(dx * dx + dy * dy + dz2 * dz2);
-
-                // 液滴1（向上运动）
-                if (r1 < radius)
+                for (int z = 1; z < lz + 1; ++z)
                 {
-                    fei[x][y][z] = params.fei_max; // 液相饱和值
-                    rho[x][y][z] = params.rho_L;   // 液相密度
-                    w[x][y][z] = -velocity;        // 向上速度
-                }
+                    const double dx = x - cx;
+                    const double dy = y - cy;
+                    const double dz = (z - 1) - cz;
+                    const double r = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    double liquid_fraction = 0.0;
+                    if (use_tanh_profile)
+                    {
+                        liquid_fraction = 0.5 * (1.0 - std::tanh((r - radius) / interface_width));
+                    }
+                    else if (r < radius)
+                    {
+                        liquid_fraction = 1.0;
+                    }
 
-                // 液滴2（向下运动）
-                if (r2 < radius)
-                {
-                    fei[x][y][z] = params.fei_max; // 液相饱和值
-                    rho[x][y][z] = params.rho_L;   // 液相密度
-                    w[x][y][z] = velocity;         // 向下速度
+                    if (liquid_fraction > 0.0)
+                    {
+                        const double local_fei = params.fei_min + liquid_fraction * (params.fei_max - params.fei_min);
+                        if (local_fei > fei[x][y][z])
+                        {
+                            fei[x][y][z] = local_fei;
+                            rho[x][y][z] = params.rho_G + liquid_fraction * (params.rho_L - params.rho_G);
+                            w[x][y][z] = vz * liquid_fraction;
+                        }
+                    }
                 }
             }
         }
+    };
+
+    if (params.init_profile != "sharp" && params.init_profile != "tanh")
+    {
+        std::cerr << "警告: 未知init_profile=" << params.init_profile
+                  << "，回退到sharp" << std::endl;
     }
+
+    if (params.init_mode == "single_droplet")
+    {
+        const double cx = (params.init_center_x >= 0.0) ? params.init_center_x : lx / 2.0;
+        const double cy = (params.init_center_y >= 0.0) ? params.init_center_y : cy_default;
+        const double cz = (params.init_center_z >= 0.0) ? params.init_center_z : cz_default;
+        place_droplet(cx, cy, cz, params.init_velocity);
+        return;
+    }
+
+    if (params.init_mode != "two_droplets")
+    {
+        std::cerr << "警告: 未知init_mode=" << params.init_mode
+                  << "，回退到two_droplets" << std::endl;
+    }
+
+    const double cx = (params.init_center_x >= 0.0) ? params.init_center_x : 0.0;
+    const double cy = (params.init_center_y >= 0.0) ? params.init_center_y : cy_default;
+    const double separation = (params.init_separation >= 0.0) ? params.init_separation : params.DD;
+    const double cx1 = cx - 0.5 * params.init_offset_x;
+    const double cx2 = cx + 0.5 * params.init_offset_x;
+    const double cz1 = (params.init_center_z >= 0.0) ? params.init_center_z + separation : cz_default + separation;
+    const double cz2 = (params.init_center_z >= 0.0) ? params.init_center_z - separation : cz_default - separation;
+    place_droplet(cx1, cy, cz1, -params.init_velocity);
+    place_droplet(cx2, cy, cz2, params.init_velocity);
 }
 
 void Inamuro::slipBounceBack(Vector4D& dist)
