@@ -39,6 +39,26 @@ struct RunConfig {
     bool poisson_graph = false;
     std::string poisson_diagnostics;
     bool poisson_spatial_diagnostics = false;
+    std::string pressure_init_file;
+    std::string pressure_init_dir;
+    std::string pressure_init_wait_dir;
+    int pressure_init_wait_timeout_ms = 0;
+    int pressure_init_wait_max_step = 0;
+    std::string pressure_init_mode = "absolute";
+    int pressure_init_max_iterations = 0;
+    int pressure_init_check_interval = 0;
+    bool write_poisson_pairs = false;
+    std::string poisson_pair_dir = "pinn_pairs";
+    std::string poisson_pair_phase = "both";
+    std::string poisson_pair_format = "tecplot";
+    int poisson_pair_max_step = 0;
+    std::set<int> poisson_pair_steps;
+    bool poisson_pair_steps_set = false;
+    int poisson_pair_start_step = 1;
+    int poisson_pair_interval = 0;
+    std::string poisson_state_export_dir;
+    std::set<int> poisson_state_export_steps;
+    std::string poisson_state_export_phase = "pre";
 };
 
 void print_usage(const char* argv0)
@@ -55,6 +75,18 @@ void print_usage(const char* argv0)
         << "       [--output-frequency N] [--output-steps A,B,C]\n"
         << "       [--poisson-graph] [--poisson-detail] [--poisson-diagnostics CSV]\n"
         << "       [--poisson-spatial-diagnostics]\n"
+        << "       [--pressure-init-file FILE] [--pressure-init-dir DIR]\n"
+        << "       [--pressure-init-wait-dir DIR] [--pressure-init-wait-timeout-ms N]\n"
+        << "       [--pressure-init-wait-max-step N]\n"
+        << "       [--pressure-init-mode absolute|delta]\n"
+        << "       [--pressure-init-max-iterations N]\n"
+        << "       [--pressure-init-check-interval N]\n"
+        << "       [--write-poisson-pairs] [--poisson-pair-dir DIR] [--poisson-pair-max-step N]\n"
+        << "       [--poisson-pair-phase pre|post|both]\n"
+        << "       [--poisson-pair-format tecplot|features|state]\n"
+        << "       [--poisson-pair-steps A,B,C] [--poisson-pair-start-step N] [--poisson-pair-interval N]\n"
+        << "       [--poisson-state-export-dir DIR] [--poisson-state-export-steps A,B,C]\n"
+        << "       [--poisson-state-export-phase pre|post|both]\n"
         << "       [--write-output] [--no-roofline]\n";
 }
 
@@ -85,6 +117,33 @@ bool should_write_step(const RunConfig& cfg, int completed_step)
         return cfg.output_steps.count(completed_step) > 0;
     }
     return completed_step % cfg.output_frequency == 0;
+}
+
+bool should_write_pair_step(const RunConfig& cfg, int completed_step)
+{
+    if (!cfg.write_poisson_pairs) {
+        return false;
+    }
+    if (cfg.poisson_pair_steps_set) {
+        return cfg.poisson_pair_steps.count(completed_step) > 0;
+    }
+    if (cfg.poisson_pair_max_step > 0 && completed_step > cfg.poisson_pair_max_step) {
+        return false;
+    }
+    if (cfg.poisson_pair_interval > 0) {
+        if (completed_step < cfg.poisson_pair_start_step) {
+            return false;
+        }
+        return ((completed_step - cfg.poisson_pair_start_step) % cfg.poisson_pair_interval) == 0;
+    }
+    return true;
+}
+
+std::filesystem::path pressure_init_path_for_step(const std::string& dir, int completed_step)
+{
+    std::ostringstream name;
+    name << "3D" << std::setfill('0') << std::setw(9) << completed_step << ".bin";
+    return std::filesystem::path(dir) / name.str();
 }
 
 void load_run_config_from_params(const std::string& filename, RunConfig& cfg,
@@ -174,6 +233,45 @@ RunConfig parse_args(int argc, char** argv)
             cfg.poisson_diagnostics = require_value(arg);
         } else if (arg == "--poisson-spatial-diagnostics") {
             cfg.poisson_spatial_diagnostics = true;
+        } else if (arg == "--pressure-init-file") {
+            cfg.pressure_init_file = require_value(arg);
+        } else if (arg == "--pressure-init-dir") {
+            cfg.pressure_init_dir = require_value(arg);
+        } else if (arg == "--pressure-init-wait-dir") {
+            cfg.pressure_init_wait_dir = require_value(arg);
+        } else if (arg == "--pressure-init-wait-timeout-ms") {
+            cfg.pressure_init_wait_timeout_ms = std::stoi(require_value(arg));
+        } else if (arg == "--pressure-init-wait-max-step") {
+            cfg.pressure_init_wait_max_step = std::stoi(require_value(arg));
+        } else if (arg == "--pressure-init-mode") {
+            cfg.pressure_init_mode = require_value(arg);
+        } else if (arg == "--pressure-init-max-iterations") {
+            cfg.pressure_init_max_iterations = std::stoi(require_value(arg));
+        } else if (arg == "--pressure-init-check-interval") {
+            cfg.pressure_init_check_interval = std::stoi(require_value(arg));
+        } else if (arg == "--write-poisson-pairs") {
+            cfg.write_poisson_pairs = true;
+        } else if (arg == "--poisson-pair-dir") {
+            cfg.poisson_pair_dir = require_value(arg);
+        } else if (arg == "--poisson-pair-phase") {
+            cfg.poisson_pair_phase = require_value(arg);
+        } else if (arg == "--poisson-pair-format") {
+            cfg.poisson_pair_format = require_value(arg);
+        } else if (arg == "--poisson-pair-max-step") {
+            cfg.poisson_pair_max_step = std::stoi(require_value(arg));
+        } else if (arg == "--poisson-pair-steps") {
+            cfg.poisson_pair_steps = parse_output_steps(require_value(arg));
+            cfg.poisson_pair_steps_set = true;
+        } else if (arg == "--poisson-pair-start-step") {
+            cfg.poisson_pair_start_step = std::stoi(require_value(arg));
+        } else if (arg == "--poisson-pair-interval") {
+            cfg.poisson_pair_interval = std::stoi(require_value(arg));
+        } else if (arg == "--poisson-state-export-dir") {
+            cfg.poisson_state_export_dir = require_value(arg);
+        } else if (arg == "--poisson-state-export-steps") {
+            cfg.poisson_state_export_steps = parse_output_steps(require_value(arg));
+        } else if (arg == "--poisson-state-export-phase") {
+            cfg.poisson_state_export_phase = require_value(arg);
         } else if (arg == "--no-roofline") {
             cfg.print_roofline = false;
         } else {
@@ -204,6 +302,49 @@ RunConfig parse_args(int argc, char** argv)
     }
     if (!(cfg.poisson_two_grid_strength >= 0.0)) {
         throw std::runtime_error("--poisson-two-grid-strength must be non-negative");
+    }
+    if (cfg.pressure_init_mode != "absolute" && cfg.pressure_init_mode != "delta") {
+        throw std::runtime_error("--pressure-init-mode must be absolute or delta");
+    }
+    if (cfg.pressure_init_max_iterations < 0) {
+        throw std::runtime_error("--pressure-init-max-iterations must be non-negative");
+    }
+    if (cfg.pressure_init_check_interval < 0) {
+        throw std::runtime_error("--pressure-init-check-interval must be non-negative");
+    }
+    if (cfg.pressure_init_wait_timeout_ms < 0) {
+        throw std::runtime_error("--pressure-init-wait-timeout-ms must be non-negative");
+    }
+    if (cfg.pressure_init_wait_max_step < 0) {
+        throw std::runtime_error("--pressure-init-wait-max-step must be non-negative");
+    }
+    if (cfg.poisson_pair_phase != "pre" && cfg.poisson_pair_phase != "post" &&
+        cfg.poisson_pair_phase != "both") {
+        throw std::runtime_error("--poisson-pair-phase must be pre, post, or both");
+    }
+    if (cfg.poisson_pair_format != "tecplot" && cfg.poisson_pair_format != "features" &&
+        cfg.poisson_pair_format != "state") {
+        throw std::runtime_error("--poisson-pair-format must be tecplot, features, or state");
+    }
+    const int pressure_init_sources =
+        (!cfg.pressure_init_file.empty() ? 1 : 0) +
+        (!cfg.pressure_init_dir.empty() ? 1 : 0) +
+        (!cfg.pressure_init_wait_dir.empty() ? 1 : 0);
+    if (pressure_init_sources > 1) {
+        throw std::runtime_error("--pressure-init-file, --pressure-init-dir, and --pressure-init-wait-dir are mutually exclusive");
+    }
+    if (cfg.poisson_pair_max_step < 0) {
+        throw std::runtime_error("--poisson-pair-max-step must be non-negative");
+    }
+    if (cfg.poisson_pair_start_step <= 0) {
+        throw std::runtime_error("--poisson-pair-start-step must be positive");
+    }
+    if (cfg.poisson_state_export_phase != "pre" && cfg.poisson_state_export_phase != "post" &&
+        cfg.poisson_state_export_phase != "both") {
+        throw std::runtime_error("--poisson-state-export-phase must be pre, post, or both");
+    }
+    if (cfg.poisson_pair_interval < 0) {
+        throw std::runtime_error("--poisson-pair-interval must be non-negative");
     }
 
     load_run_config_from_params(cfg.params, cfg, steps_set, output_frequency_set);
@@ -260,6 +401,25 @@ int main(int argc, char** argv)
                   << " poisson_two_grid_strength=" << cfg.poisson_two_grid_strength
                   << " poisson_diagnostics=" << (cfg.poisson_diagnostics.empty() ? "none" : cfg.poisson_diagnostics)
                   << " poisson_spatial_diagnostics=" << (cfg.poisson_spatial_diagnostics ? "yes" : "no")
+                  << " pressure_init=" << (cfg.pressure_init_file.empty() ? "none" : cfg.pressure_init_file)
+                  << " pressure_init_dir=" << (cfg.pressure_init_dir.empty() ? "none" : cfg.pressure_init_dir)
+                  << " pressure_init_wait_dir=" << (cfg.pressure_init_wait_dir.empty() ? "none" : cfg.pressure_init_wait_dir)
+                  << " pressure_init_wait_timeout_ms=" << cfg.pressure_init_wait_timeout_ms
+                  << " pressure_init_wait_max_step=" << cfg.pressure_init_wait_max_step
+                  << " pressure_init_mode=" << cfg.pressure_init_mode
+                  << " pressure_init_max_iterations=" << cfg.pressure_init_max_iterations
+                  << " pressure_init_check_interval=" << cfg.pressure_init_check_interval
+                  << " write_poisson_pairs=" << (cfg.write_poisson_pairs ? "yes" : "no")
+                  << " poisson_pair_dir=" << cfg.poisson_pair_dir
+                  << " poisson_pair_phase=" << cfg.poisson_pair_phase
+                  << " poisson_pair_format=" << cfg.poisson_pair_format
+                  << " poisson_pair_max_step=" << cfg.poisson_pair_max_step
+                  << " poisson_pair_steps=" << cfg.poisson_pair_steps.size()
+                  << " poisson_pair_start_step=" << cfg.poisson_pair_start_step
+                  << " poisson_pair_interval=" << cfg.poisson_pair_interval
+                  << " poisson_state_export_dir=" << (cfg.poisson_state_export_dir.empty() ? "none" : cfg.poisson_state_export_dir)
+                  << " poisson_state_export_steps=" << cfg.poisson_state_export_steps.size()
+                  << " poisson_state_export_phase=" << cfg.poisson_state_export_phase
                   << " params=" << cfg.params
                   << " steps=" << cfg.steps
                   << " output_steps=" << cfg.output_steps.size()
@@ -300,8 +460,54 @@ int main(int argc, char** argv)
         gpu.setPoissonConvergence(cfg.poisson_check_interval, cfg.poisson_tolerance);
         gpu.setPoissonDiagnosticsPath(cfg.poisson_diagnostics);
         gpu.setUsePoissonSpatialDiagnostics(cfg.poisson_spatial_diagnostics);
+        gpu.setPressureInitializerMaxIterations(cfg.pressure_init_max_iterations);
+        gpu.setPressureInitializerCheckInterval(cfg.pressure_init_check_interval);
+        gpu.setPoissonStateExport(
+            cfg.poisson_state_export_dir, cfg.poisson_state_export_steps, cfg.poisson_state_export_phase);
+        if (!cfg.pressure_init_wait_dir.empty()) {
+            gpu.setPressureInitializerWaitDir(
+                cfg.pressure_init_wait_dir,
+                cfg.pressure_init_wait_timeout_ms,
+                cfg.pressure_init_wait_max_step);
+        }
+        if (cfg.pressure_init_dir.empty() && cfg.pressure_init_wait_dir.empty()) {
+            gpu.setPressureInitializer(cfg.pressure_init_file, cfg.pressure_init_mode);
+        }
         const double ms = run_loop(solver, cfg, [&](bool need_output) {
-            gpu.performTimeStepGPU();
+            static int completed_step = 0;
+            ++completed_step;
+            if (!cfg.pressure_init_dir.empty()) {
+                const std::filesystem::path init_path =
+                    pressure_init_path_for_step(cfg.pressure_init_dir, completed_step);
+                if (std::filesystem::exists(init_path)) {
+                    gpu.setPressureInitializer(init_path.string(), cfg.pressure_init_mode);
+                } else {
+                    gpu.setPressureInitializer("", cfg.pressure_init_mode);
+                }
+            }
+            const bool write_pairs_this_step = should_write_pair_step(cfg, completed_step);
+            if (!cfg.pressure_init_wait_dir.empty()) {
+                if (write_pairs_this_step) {
+                    gpu.setPressureInitializerWaitDir(
+                        cfg.pressure_init_wait_dir,
+                        cfg.pressure_init_wait_timeout_ms,
+                        cfg.pressure_init_wait_max_step);
+                } else {
+                    gpu.setPressureInitializer("", cfg.pressure_init_mode);
+                    gpu.setPressureInitializerWaitDir("", 0, 0);
+                }
+            }
+            if (write_pairs_this_step) {
+                gpu.performTimeStepGPUWithPoissonPair(
+                    solver,
+                    completed_step,
+                    cfg.poisson_pair_dir,
+                    cfg.poisson_pair_format,
+                    cfg.poisson_pair_phase != "post",
+                    cfg.poisson_pair_phase != "pre");
+            } else {
+                gpu.performTimeStepGPU();
+            }
             if (need_output) {
                 gpu.downloadFieldsToCPU(solver);
             }

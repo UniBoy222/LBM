@@ -1,10 +1,17 @@
 #include "InamuroCUDA.hpp"
+#include "BookPressureTest.hpp"
 #include <cmath>
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <sstream>
+#include <thread>
+#include <utility>
 
 // 简单错误检查宏
 #ifndef CUDA_CHECK
@@ -776,6 +783,83 @@ __global__ void sourceAwareHHInitKernel(
     }
 }
 
+__global__ void applyPressureInitializerKernel(
+    double* __restrict__ p,
+    const double* __restrict__ pressure_init,
+    int lx, int ly, int lz, int lztot,
+    int is_delta)
+{
+    const int global = blockIdx.x * blockDim.x + threadIdx.x;
+    const int n = lx * ly * lz;
+    if (global >= n) return;
+
+    const int x = global % lx;
+    const int y = (global / lx) % ly;
+    const int z = global / (lx * ly);
+    const int macro_idx = ((z + 1) * ly + y) * lx + x;
+    const double value = pressure_init[global];
+    p[macro_idx] = is_delta ? (p[macro_idx] + value) : value;
+}
+
+__global__ void seedPressurePrevKernel(
+    const double* __restrict__ p,
+    double* __restrict__ p_prev,
+    int lx, int ly, int lz, int lztot)
+{
+    const int global = blockIdx.x * blockDim.x + threadIdx.x;
+    const int n = lx * ly * lz;
+    if (global >= n) return;
+
+    const int x = global % lx;
+    const int y = (global / lx) % ly;
+    const int z = global / (lx * ly);
+    const int macro_idx = ((z + 1) * ly + y) * lx + x;
+    p_prev[global] = p[macro_idx];
+}
+
+__global__ void packPoissonFeatureSnapshotKernel(
+    const double* __restrict__ u,
+    const double* __restrict__ v,
+    const double* __restrict__ w,
+    const double* __restrict__ rho,
+    const double* __restrict__ fei,
+    const double* __restrict__ press,
+    const double* __restrict__ upx,
+    const double* __restrict__ vpy,
+    const double* __restrict__ wpz,
+    float* __restrict__ out,
+    int lx, int ly, int lz, int lztot)
+{
+    const int n = lx * ly * lz;
+    const int global = blockIdx.x * blockDim.x + threadIdx.x;
+    if (global >= 7 * n) return;
+
+    const int field = global / n;
+    const int cell = global - field * n;
+    const int x = cell % lx;
+    const int y = (cell / lx) % ly;
+    const int z = cell / (lx * ly);
+    const int macro_idx = ((z + 1) * ly + y) * lx + x;
+
+    double value = 0.0;
+    if (field == 0) {
+        value = u[macro_idx];
+    } else if (field == 1) {
+        value = v[macro_idx];
+    } else if (field == 2) {
+        value = w[macro_idx];
+    } else if (field == 3) {
+        value = rho[macro_idx];
+    } else if (field == 4) {
+        value = fei[macro_idx];
+    } else if (field == 5) {
+        value = press[macro_idx];
+    } else {
+        value = upx[cell] + vpy[cell] + wpz[cell];
+    }
+    out[global] = static_cast<float>(value);
+}
+
 __global__ void andersonStoreHistoryKernel(
     const double* __restrict__ h_old,
     const double* __restrict__ h_image,
@@ -1320,7 +1404,8 @@ void InamuroCUDA::freeDeviceMemory()
     S(gpu.d_v_x);   S(gpu.d_v_y);   S(gpu.d_v_z);
     S(gpu.d_w_x);   S(gpu.d_w_y);   S(gpu.d_w_z);
     S(gpu.d_fei_lap); S(gpu.d_u_lap); S(gpu.d_v_lap); S(gpu.d_w_lap);
-    S(gpu.d_p_prev); S(gpu.d_pressure_error);
+    S(gpu.d_p_prev); S(gpu.d_pressure_error); S(gpu.d_pressure_init); S(gpu.d_hh_init);
+    S(gpu.d_p_backup); S(gpu.d_hh_backup); S(gpu.d_p_prev_backup);
     S(gpu.d_anderson_prev_residual); S(gpu.d_anderson_prev_image); S(gpu.d_anderson_stats);
     S(gpu.d_pressure_block_sums); S(gpu.d_pressure_block_error);
 }
@@ -1510,10 +1595,8 @@ void InamuroCUDA::doPressurePoisson()
     dim3 grid2d((ly+block2d.x-1)/block2d.x, (lz+block2d.y-1)/block2d.y);
 
     constexpr int max_iterations = 1000;
-    const int check_interval = poisson_check_interval;
     const double tolerance = poisson_tolerance;
 
-    int iterations_used = max_iterations;
     cudaEvent_t phase_start{}, phase_stop{};
     const bool detail_timing = enable_timing && enable_poisson_detail_timing;
     const bool graph_eligible =
@@ -1523,9 +1606,9 @@ void InamuroCUDA::doPressurePoisson()
         !use_poisson_two_grid_correction &&
         (use_onepass_poisson || (use_fused_poisson && use_fused_boundary_pressure)) &&
         !detail_timing &&
-        check_interval > 0 &&
-        (check_interval % 2) == 0 &&
-        (max_iterations % check_interval) == 0;
+        poisson_check_interval > 0 &&
+        (poisson_check_interval % 2) == 0 &&
+        (max_iterations % poisson_check_interval) == 0;
 
     if (detail_timing) {
         CUDA_CHECK(cudaEventCreate(&phase_start));
@@ -1618,174 +1701,219 @@ void InamuroCUDA::doPressurePoisson()
         return converged;
     };
 
-    if (use_source_aware_hh_init && !use_scalar_poisson) {
-        begin_phase();
-        sourceAwareHHInitKernel<<<grid, block>>>(
-            gpu.d_hh, gpu.d_p, gpu.d_rho,
-            gpu.d_u_x, gpu.d_v_y, gpu.d_w_z,
-            lx, ly, lz, lz_total,
-            source_aware_hh_scale
-        );
-        CUDA_CHECK(cudaGetLastError());
-        end_phase(perf.poisson_init_time);
-    }
+    auto run_poisson_iterations = [&](int iteration_limit, int requested_check_interval) -> std::pair<int, bool> {
+        iteration_limit = std::max(1, std::min(iteration_limit, max_iterations));
+        const int check_interval = requested_check_interval > 0 ? requested_check_interval : poisson_check_interval;
+        int local_iterations_used = iteration_limit;
+        bool converged = false;
 
-    if (graph_eligible) {
-        if (!poisson_graph_exec || poisson_graph_check_interval != check_interval) {
-            buildPoissonGraphSegment();
-        }
-
-        const int segments = max_iterations / check_interval;
-        for (int segment = 1; segment <= segments; ++segment) {
-            CUDA_CHECK(cudaGraphLaunch(poisson_graph_exec, 0));
-            if (check_residual(segment * check_interval)) {
-                iterations_used = segment * check_interval;
-                break;
-            }
-        }
-        perf.total_poisson_iterations += iterations_used;
-        return;
-    }
-
-    bool anderson_has_history = false;
-    const int anderson_values = N_cells * 15;
-    const int anderson_threads = 256;
-    const int anderson_blocks = (anderson_values + anderson_threads - 1) / anderson_threads;
-
-    // 与CPU版本一致：最多1000次，每100次检查相对压力变化。
-    for (int iter = 1; iter <= max_iterations; ++iter) {
-        if (use_scalar_poisson) {
+        if (use_source_aware_hh_init && !use_scalar_poisson) {
             begin_phase();
-            scalarPressureJacobiKernel<<<onepass_grid, onepass_block>>>(
-                gpu.d_p, gpu.d_p_tmp, gpu.d_rho,
-                gpu.d_u_x, gpu.d_v_y, gpu.d_w_z,
-                lx, ly, lz, lz_total,
-                scalar_poisson_source_scale
-            );
-            CUDA_CHECK(cudaGetLastError());
-            end_phase(perf.poisson_scalar_time);
-            std::swap(gpu.d_p, gpu.d_p_tmp);
-        } else if (use_onepass_poisson) {
-            begin_phase();
-            collisionStreamBoundaryPressureKernel<<<onepass_grid, onepass_block>>>(
-                gpu.d_hh, gpu.d_hh_tmp, gpu.d_p, gpu.d_p_tmp, gpu.d_rho,
-                gpu.d_u_x, gpu.d_v_y, gpu.d_w_z,
-                lx, ly, lz, lz_total,
-                pressure_relax_scale,
-                poisson_fixed_point_relax
-            );
-            CUDA_CHECK(cudaGetLastError());
-            end_phase(perf.poisson_onepass_time);
-            if (use_poisson_anderson_m1) {
-                if (!anderson_has_history) {
-                    andersonStoreHistoryKernel<<<anderson_blocks, anderson_threads>>>(
-                        gpu.d_hh, gpu.d_hh_tmp,
-                        gpu.d_anderson_prev_residual,
-                        gpu.d_anderson_prev_image,
-                        anderson_values
-                    );
-                    CUDA_CHECK(cudaGetLastError());
-                    anderson_has_history = true;
-                } else {
-                    CUDA_CHECK(cudaMemset(gpu.d_anderson_stats, 0, 2 * sizeof(double)));
-                    andersonM1DotKernel<<<
-                        anderson_blocks,
-                        anderson_threads,
-                        2 * anderson_threads * sizeof(double)>>>(
-                        gpu.d_hh, gpu.d_hh_tmp,
-                        gpu.d_anderson_prev_residual,
-                        gpu.d_anderson_stats,
-                        anderson_values
-                    );
-                    CUDA_CHECK(cudaGetLastError());
-                    double h_stats[2] = {0.0, 0.0};
-                    CUDA_CHECK(cudaMemcpy(h_stats, gpu.d_anderson_stats, sizeof(h_stats), cudaMemcpyDeviceToHost));
-                    double alpha = 1.0;
-                    if (h_stats[1] > 1.0e-300) {
-                        alpha = -h_stats[0] / h_stats[1];
-                    }
-                    if (!std::isfinite(alpha)) {
-                        alpha = 1.0;
-                    }
-                    const double lo = -poisson_anderson_beta_max;
-                    const double hi = 1.0 + poisson_anderson_beta_max;
-                    alpha = std::max(lo, std::min(hi, alpha));
-                    andersonM1ApplyKernel<<<onepass_grid, onepass_block>>>(
-                        gpu.d_hh, gpu.d_hh_tmp,
-                        gpu.d_anderson_prev_image,
-                        gpu.d_anderson_prev_residual,
-                        gpu.d_anderson_prev_image,
-                        gpu.d_p_tmp,
-                        lx, ly, lz, lz_total,
-                        alpha
-                    );
-                    CUDA_CHECK(cudaGetLastError());
-                }
-            }
-            std::swap(gpu.d_hh, gpu.d_hh_tmp);
-            std::swap(gpu.d_p, gpu.d_p_tmp);
-        } else if (use_fused_poisson) {
-            begin_phase();
-            collisionPressureStreamKernel<<<grid, block>>>(
-                gpu.d_hh, gpu.d_hh_tmp, gpu.d_p, gpu.d_rho,
-                gpu.d_u_x, gpu.d_v_y, gpu.d_w_z,
-                lx, ly, lz, lz_total,
-                pressure_relax_scale
-            );
-            CUDA_CHECK(cudaGetLastError());
-            end_phase(perf.poisson_fused_time);
-            std::swap(gpu.d_hh, gpu.d_hh_tmp);
-        } else {
-            begin_phase();
-            collisionPressureKernel<<<grid, block>>>(
+            sourceAwareHHInitKernel<<<grid, block>>>(
                 gpu.d_hh, gpu.d_p, gpu.d_rho,
                 gpu.d_u_x, gpu.d_v_y, gpu.d_w_z,
                 lx, ly, lz, lz_total,
-                pressure_relax_scale
+                source_aware_hh_scale
             );
             CUDA_CHECK(cudaGetLastError());
-            end_phase(perf.poisson_collision_time);
-
-            begin_phase();
-            streamKernel<<<grid, block>>>(gpu.d_hh, gpu.d_hh_tmp, lx, ly, lz);
-            CUDA_CHECK(cudaGetLastError());
-            end_phase(perf.poisson_stream_time);
-            std::swap(gpu.d_hh, gpu.d_hh_tmp);
+            end_phase(perf.poisson_init_time);
         }
 
-        if (!use_onepass_poisson && use_fused_boundary_pressure) {
-            begin_phase();
-            boundaryAndComputePressureKernel<<<grid, block>>>(
-                gpu.d_hh, gpu.d_p,
-                lx, ly, lz, lz_total
-            );
-            CUDA_CHECK(cudaGetLastError());
-            end_phase(perf.poisson_boundary_pressure_time);
-        } else if (!use_onepass_poisson) {
-            // 3. hh边界
-            begin_phase();
-            slipBounceBackKernel<<<grid2d, block2d>>>(gpu.d_hh, lx, ly, lz);
-            CUDA_CHECK(cudaGetLastError());
-            end_phase(perf.poisson_boundary_time);
+        const bool use_graph_for_this_run =
+            graph_eligible && iteration_limit == max_iterations && check_interval == poisson_check_interval;
+        if (use_graph_for_this_run) {
+            if (!poisson_graph_exec || poisson_graph_check_interval != check_interval) {
+                buildPoissonGraphSegment();
+            }
 
-            // 4. 计算压力
-            begin_phase();
-            computePressureKernel<<<grid, block>>>(
-                gpu.d_hh, gpu.d_p,
-                lx, ly, lz, lz_total
-            );
-            CUDA_CHECK(cudaGetLastError());
-            end_phase(perf.poisson_pressure_time);
+            const int segments = iteration_limit / check_interval;
+            for (int segment = 1; segment <= segments; ++segment) {
+                CUDA_CHECK(cudaGraphLaunch(poisson_graph_exec, 0));
+                if (check_residual(segment * check_interval)) {
+                    local_iterations_used = segment * check_interval;
+                    converged = true;
+                    break;
+                }
+            }
+            return {local_iterations_used, converged};
         }
 
-        if (iter % check_interval == 0) {
-            if (check_residual(iter)) {
-                iterations_used = iter;
-                break;
+        bool anderson_has_history = false;
+        const int anderson_values = N_cells * 15;
+        const int anderson_threads = 256;
+        const int anderson_blocks = (anderson_values + anderson_threads - 1) / anderson_threads;
+
+        // 与CPU版本一致：最多1000次，每100次检查相对压力变化。
+        for (int iter = 1; iter <= iteration_limit; ++iter) {
+            if (use_scalar_poisson) {
+                begin_phase();
+                scalarPressureJacobiKernel<<<onepass_grid, onepass_block>>>(
+                    gpu.d_p, gpu.d_p_tmp, gpu.d_rho,
+                    gpu.d_u_x, gpu.d_v_y, gpu.d_w_z,
+                    lx, ly, lz, lz_total,
+                    scalar_poisson_source_scale
+                );
+                CUDA_CHECK(cudaGetLastError());
+                end_phase(perf.poisson_scalar_time);
+                std::swap(gpu.d_p, gpu.d_p_tmp);
+            } else if (use_onepass_poisson) {
+                begin_phase();
+                collisionStreamBoundaryPressureKernel<<<onepass_grid, onepass_block>>>(
+                    gpu.d_hh, gpu.d_hh_tmp, gpu.d_p, gpu.d_p_tmp, gpu.d_rho,
+                    gpu.d_u_x, gpu.d_v_y, gpu.d_w_z,
+                    lx, ly, lz, lz_total,
+                    pressure_relax_scale,
+                    poisson_fixed_point_relax
+                );
+                CUDA_CHECK(cudaGetLastError());
+                end_phase(perf.poisson_onepass_time);
+                if (use_poisson_anderson_m1) {
+                    if (!anderson_has_history) {
+                        andersonStoreHistoryKernel<<<anderson_blocks, anderson_threads>>>(
+                            gpu.d_hh, gpu.d_hh_tmp,
+                            gpu.d_anderson_prev_residual,
+                            gpu.d_anderson_prev_image,
+                            anderson_values
+                        );
+                        CUDA_CHECK(cudaGetLastError());
+                        anderson_has_history = true;
+                    } else {
+                        CUDA_CHECK(cudaMemset(gpu.d_anderson_stats, 0, 2 * sizeof(double)));
+                        andersonM1DotKernel<<<
+                            anderson_blocks,
+                            anderson_threads,
+                            2 * anderson_threads * sizeof(double)>>>(
+                            gpu.d_hh, gpu.d_hh_tmp,
+                            gpu.d_anderson_prev_residual,
+                            gpu.d_anderson_stats,
+                            anderson_values
+                        );
+                        CUDA_CHECK(cudaGetLastError());
+                        double h_stats[2] = {0.0, 0.0};
+                        CUDA_CHECK(cudaMemcpy(h_stats, gpu.d_anderson_stats, sizeof(h_stats), cudaMemcpyDeviceToHost));
+                        double alpha = 1.0;
+                        if (h_stats[1] > 1.0e-300) {
+                            alpha = -h_stats[0] / h_stats[1];
+                        }
+                        if (!std::isfinite(alpha)) {
+                            alpha = 1.0;
+                        }
+                        const double lo = -poisson_anderson_beta_max;
+                        const double hi = 1.0 + poisson_anderson_beta_max;
+                        alpha = std::max(lo, std::min(hi, alpha));
+                        andersonM1ApplyKernel<<<onepass_grid, onepass_block>>>(
+                            gpu.d_hh, gpu.d_hh_tmp,
+                            gpu.d_anderson_prev_image,
+                            gpu.d_anderson_prev_residual,
+                            gpu.d_anderson_prev_image,
+                            gpu.d_p_tmp,
+                            lx, ly, lz, lz_total,
+                            alpha
+                        );
+                        CUDA_CHECK(cudaGetLastError());
+                    }
+                }
+                std::swap(gpu.d_hh, gpu.d_hh_tmp);
+                std::swap(gpu.d_p, gpu.d_p_tmp);
+            } else if (use_fused_poisson) {
+                begin_phase();
+                collisionPressureStreamKernel<<<grid, block>>>(
+                    gpu.d_hh, gpu.d_hh_tmp, gpu.d_p, gpu.d_rho,
+                    gpu.d_u_x, gpu.d_v_y, gpu.d_w_z,
+                    lx, ly, lz, lz_total,
+                    pressure_relax_scale
+                );
+                CUDA_CHECK(cudaGetLastError());
+                end_phase(perf.poisson_fused_time);
+                std::swap(gpu.d_hh, gpu.d_hh_tmp);
+            } else {
+                begin_phase();
+                collisionPressureKernel<<<grid, block>>>(
+                    gpu.d_hh, gpu.d_p, gpu.d_rho,
+                    gpu.d_u_x, gpu.d_v_y, gpu.d_w_z,
+                    lx, ly, lz, lz_total,
+                    pressure_relax_scale
+                );
+                CUDA_CHECK(cudaGetLastError());
+                end_phase(perf.poisson_collision_time);
+
+                begin_phase();
+                streamKernel<<<grid, block>>>(gpu.d_hh, gpu.d_hh_tmp, lx, ly, lz);
+                CUDA_CHECK(cudaGetLastError());
+                end_phase(perf.poisson_stream_time);
+                std::swap(gpu.d_hh, gpu.d_hh_tmp);
+            }
+
+            if (!use_onepass_poisson && use_fused_boundary_pressure) {
+                begin_phase();
+                boundaryAndComputePressureKernel<<<grid, block>>>(
+                    gpu.d_hh, gpu.d_p,
+                    lx, ly, lz, lz_total
+                );
+                CUDA_CHECK(cudaGetLastError());
+                end_phase(perf.poisson_boundary_pressure_time);
+            } else if (!use_onepass_poisson) {
+                // 3. hh边界
+                begin_phase();
+                slipBounceBackKernel<<<grid2d, block2d>>>(gpu.d_hh, lx, ly, lz);
+                CUDA_CHECK(cudaGetLastError());
+                end_phase(perf.poisson_boundary_time);
+
+                // 4. 计算压力
+                begin_phase();
+                computePressureKernel<<<grid, block>>>(
+                    gpu.d_hh, gpu.d_p,
+                    lx, ly, lz, lz_total
+                );
+                CUDA_CHECK(cudaGetLastError());
+                end_phase(perf.poisson_pressure_time);
+            }
+
+            if ((iter % check_interval == 0) || iter == iteration_limit) {
+                if (check_residual(iter)) {
+                    local_iterations_used = iter;
+                    converged = true;
+                    break;
+                }
             }
         }
+        return {local_iterations_used, converged};
+    };
+
+    if (pressure_initializer_loaded) {
+        CUDA_CHECK(cudaMemcpy(gpu.d_p_backup, gpu.d_p, N_macro * sizeof(double), cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(cudaMemcpy(gpu.d_hh_backup, gpu.d_hh, N_cells * Q * sizeof(double), cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(cudaMemcpy(gpu.d_p_prev_backup, gpu.d_p_prev, N_cells * sizeof(double), cudaMemcpyDeviceToDevice));
+        applyPressureInitializer();
+        perf.pressure_initializer_attempts++;
     }
-    perf.total_poisson_iterations += iterations_used;
+
+    int first_iteration_limit = max_iterations;
+    if (pressure_initializer_loaded && pressure_initializer_max_iterations > 0) {
+        first_iteration_limit = std::min(pressure_initializer_max_iterations, max_iterations);
+    }
+    const int first_check_interval =
+        pressure_initializer_loaded && pressure_initializer_check_interval > 0
+            ? pressure_initializer_check_interval
+            : poisson_check_interval;
+    auto [first_iterations, first_converged] =
+        run_poisson_iterations(first_iteration_limit, first_check_interval);
+    perf.total_poisson_iterations += first_iterations;
+
+    if (pressure_initializer_loaded) {
+        if (first_converged) {
+            perf.pressure_initializer_accepts++;
+        } else {
+            perf.pressure_initializer_fallbacks++;
+            CUDA_CHECK(cudaMemcpy(gpu.d_p, gpu.d_p_backup, N_macro * sizeof(double), cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(gpu.d_hh, gpu.d_hh_backup, N_cells * Q * sizeof(double), cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(gpu.d_p_prev, gpu.d_p_prev_backup, N_cells * sizeof(double), cudaMemcpyDeviceToDevice));
+            auto [fallback_iterations, fallback_converged] =
+                run_poisson_iterations(max_iterations, poisson_check_interval);
+            (void)fallback_converged;
+            perf.total_poisson_iterations += fallback_iterations;
+        }
+    }
     if (detail_timing) {
         CUDA_CHECK(cudaEventDestroy(phase_start));
         CUDA_CHECK(cudaEventDestroy(phase_stop));
@@ -1815,8 +1943,142 @@ void InamuroCUDA::doCorrectUVWAndHH()
 
 void InamuroCUDA::performTimeStepGPU()
 {
+    performTimeStepGPUImpl(nullptr, 0, nullptr, "tecplot", false, false);
+}
+
+void InamuroCUDA::performTimeStepGPUWithPoissonPair(
+    Inamuro& cpuSolver,
+    int completed_step,
+    const std::string& pair_output_dir,
+    const std::string& pair_format,
+    bool write_pre_pair,
+    bool write_post_pair)
+{
+    performTimeStepGPUImpl(&cpuSolver, completed_step, &pair_output_dir, pair_format, write_pre_pair, write_post_pair);
+}
+
+void InamuroCUDA::writePoissonPairSnapshot(
+    Inamuro& cpuSolver,
+    int completed_step,
+    const std::string& pair_output_dir,
+    const std::string& phase) const
+{
+    const std::filesystem::path dir = std::filesystem::path(pair_output_dir) / phase;
+    std::filesystem::create_directories(dir);
+    const std::string old_dir = cpuSolver.getOutputDirectory();
+    cpuSolver.setOutputDirectory(dir.string());
+    downloadMacroToCPU(cpuSolver);
+    cpuSolver.writeResults(completed_step);
+    cpuSolver.setOutputDirectory(old_dir);
+}
+
+void InamuroCUDA::writePoissonFeatureSnapshot(
+    int completed_step,
+    const std::string& pair_output_dir,
+    const std::string& phase) const
+{
+    static constexpr char magic[8] = {'P', 'I', 'N', 'N', 'F', '2', '\0', '\0'};
+    static constexpr std::int32_t nfields = 7;
+
+    const std::filesystem::path dir = std::filesystem::path(pair_output_dir) / phase;
+    std::filesystem::create_directories(dir);
+
+    std::ostringstream name;
+    name << "3D" << std::setfill('0') << std::setw(9) << completed_step << ".bin";
+    const std::filesystem::path path = dir / name.str();
+
+    const std::size_t packed_count = static_cast<std::size_t>(nfields) * static_cast<std::size_t>(N_cells);
+    float* d_packed = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_packed, packed_count * sizeof(float)));
+
+    const int threads = 256;
+    const int blocks = static_cast<int>((packed_count + threads - 1) / threads);
+    packPoissonFeatureSnapshotKernel<<<blocks, threads>>>(
+        gpu.d_u, gpu.d_v, gpu.d_w, gpu.d_rho, gpu.d_fei, gpu.d_p,
+        gpu.d_u_x, gpu.d_v_y, gpu.d_w_z,
+        d_packed, lx, ly, lz, lz_total);
+    CUDA_CHECK(cudaGetLastError());
+
+    std::vector<float> packed(packed_count);
+    CUDA_CHECK(cudaMemcpy(packed.data(), d_packed, packed_count * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_packed));
+
+    std::ofstream out(path, std::ios::binary);
+    if (!out) {
+        throw std::runtime_error("failed to open Poisson feature snapshot: " + path.string());
+    }
+
+    const std::int32_t header[4] = {
+        static_cast<std::int32_t>(lx),
+        static_cast<std::int32_t>(ly),
+        static_cast<std::int32_t>(lz),
+        nfields,
+    };
+    out.write(magic, sizeof(magic));
+    out.write(reinterpret_cast<const char*>(header), sizeof(header));
+    out.write(reinterpret_cast<const char*>(packed.data()),
+              static_cast<std::streamsize>(packed.size() * sizeof(float)));
+
+    if (!out) {
+        throw std::runtime_error("failed to write Poisson feature snapshot: " + path.string());
+    }
+}
+
+void InamuroCUDA::writePoissonStateSnapshot(
+    int completed_step,
+    const std::string& pair_output_dir,
+    const std::string& phase) const
+{
+    static constexpr char magic[8] = {'P', 'I', 'N', 'N', 'S', '1', '\0', '\0'};
+    const std::filesystem::path dir = std::filesystem::path(pair_output_dir) / phase;
+    std::filesystem::create_directories(dir);
+
+    std::ostringstream name;
+    name << "3D" << std::setfill('0') << std::setw(9) << completed_step << ".bin";
+    const std::filesystem::path path = dir / name.str();
+
+    std::vector<double> pressure(N_cells);
+    std::vector<double> hh(static_cast<std::size_t>(N_cells) * Q);
+    const std::size_t physical_offset = static_cast<std::size_t>(lx) * ly;
+    CUDA_CHECK(cudaMemcpy(
+        pressure.data(), gpu.d_p + physical_offset,
+        pressure.size() * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(
+        hh.data(), gpu.d_hh,
+        hh.size() * sizeof(double), cudaMemcpyDeviceToHost));
+
+    std::ofstream out(path, std::ios::binary);
+    if (!out) {
+        throw std::runtime_error("failed to open Poisson state snapshot: " + path.string());
+    }
+    const std::int32_t dims[3] = {
+        static_cast<std::int32_t>(lx),
+        static_cast<std::int32_t>(ly),
+        static_cast<std::int32_t>(lz),
+    };
+    out.write(magic, sizeof(magic));
+    out.write(reinterpret_cast<const char*>(dims), sizeof(dims));
+    out.write(reinterpret_cast<const char*>(pressure.data()),
+              static_cast<std::streamsize>(pressure.size() * sizeof(double)));
+    out.write(reinterpret_cast<const char*>(hh.data()),
+              static_cast<std::streamsize>(hh.size() * sizeof(double)));
+    if (!out) {
+        throw std::runtime_error("failed to write Poisson state snapshot: " + path.string());
+    }
+}
+
+void InamuroCUDA::performTimeStepGPUImpl(
+    Inamuro* pair_solver,
+    int completed_step,
+    const std::string* pair_output_dir,
+    const std::string& pair_format,
+    bool write_pre_pair,
+    bool write_post_pair)
+{
     cudaEvent_t start, stop;
     float milliseconds = 0;
+    const bool write_pair = pair_output_dir != nullptr && !pair_output_dir->empty() &&
+        (pair_format == "features" || pair_solver != nullptr);
     
     if (enable_timing) {
         cudaEventCreate(&start);
@@ -1857,6 +2119,32 @@ void InamuroCUDA::performTimeStepGPU()
         cudaEventElapsedTime(&milliseconds, start, stop);
         perf.total_macro_time += milliseconds;
     }
+    auto write_pair_snapshot = [&](const std::string& phase) {
+        if (pair_format == "features") {
+            writePoissonFeatureSnapshot(completed_step, *pair_output_dir, phase);
+        } else if (pair_format == "state") {
+            writePoissonStateSnapshot(completed_step, *pair_output_dir, phase);
+        } else if (pair_format == "tecplot") {
+            writePoissonPairSnapshot(*pair_solver, completed_step, *pair_output_dir, phase);
+        } else {
+            throw std::runtime_error("unsupported Poisson pair format: " + pair_format);
+        }
+    };
+
+    if (write_pair && write_pre_pair) {
+        write_pair_snapshot("pre_poisson");
+    }
+    if (completed_step > 0 && !poisson_state_export_dir.empty() &&
+        (poisson_state_export_phase == "pre" || poisson_state_export_phase == "both") &&
+        poisson_state_export_steps.count(completed_step) > 0) {
+        writePoissonStateSnapshot(completed_step, poisson_state_export_dir, "pre_poisson");
+    }
+    if (!pressure_initializer_wait_dir.empty() && completed_step > 0 &&
+        (pressure_initializer_wait_max_step <= 0 || completed_step <= pressure_initializer_wait_max_step)) {
+        loadPressureInitializerForStep(completed_step);
+    } else if (!pressure_initializer_wait_dir.empty()) {
+        setPressureInitializer("", pressure_initializer_mode);
+    }
 
     // 5) 压力 Poisson
     if (enable_timing) cudaEventRecord(start);
@@ -1866,6 +2154,14 @@ void InamuroCUDA::performTimeStepGPU()
         cudaEventSynchronize(stop);
         cudaEventElapsedTime(&milliseconds, start, stop);
         perf.total_poisson_time += milliseconds;
+    }
+    if (write_pair && write_post_pair) {
+        write_pair_snapshot("post_poisson");
+    }
+    if (completed_step > 0 && !poisson_state_export_dir.empty() &&
+        (poisson_state_export_phase == "post" || poisson_state_export_phase == "both") &&
+        poisson_state_export_steps.count(completed_step) > 0) {
+        writePoissonStateSnapshot(completed_step, poisson_state_export_dir, "post_poisson");
     }
 
     // 6) 速度修正 + hh 更新
@@ -1902,10 +2198,11 @@ void InamuroCUDA::setUseOnePassPoisson(bool enabled)
 
 void InamuroCUDA::setUseScalarPoisson(bool enabled)
 {
-    if (use_scalar_poisson != enabled) {
-        destroyPoissonGraph();
+    if (enabled) {
+        throw std::invalid_argument(
+            "scalar/simple Poisson is disabled; use the book D3Q15 pressure operator");
     }
-    use_scalar_poisson = enabled;
+    use_scalar_poisson = false;
 }
 
 void InamuroCUDA::setScalarPoissonSourceScale(double scale)
@@ -1915,10 +2212,11 @@ void InamuroCUDA::setScalarPoissonSourceScale(double scale)
 
 void InamuroCUDA::setUseSourceAwareHHInit(bool enabled)
 {
-    if (use_source_aware_hh_init != enabled) {
-        destroyPoissonGraph();
+    if (enabled) {
+        throw std::invalid_argument(
+            "source-aware guessed hh initialization is disabled; load a complete 15-channel hh state");
     }
-    use_source_aware_hh_init = enabled;
+    use_source_aware_hh_init = false;
 }
 
 void InamuroCUDA::setSourceAwareHHScale(double scale)
@@ -2036,6 +2334,215 @@ void InamuroCUDA::setUsePoissonSpatialDiagnostics(bool enabled)
     use_poisson_spatial_diagnostics = enabled;
 }
 
+void InamuroCUDA::setPressureInitializer(const std::string& path, const std::string& mode)
+{
+    if (path.empty()) {
+        pressure_initializer_path.clear();
+        pressure_initializer_loaded = false;
+        pressure_initializer_has_hh = false;
+        return;
+    }
+    if (mode != "absolute" && mode != "delta") {
+        throw std::invalid_argument("pressure initializer mode must be absolute or delta");
+    }
+
+    pressure_initializer_path = path;
+    pressure_initializer_mode = mode;
+    loadPressureInitializer();
+}
+
+void InamuroCUDA::setPressureInitializerMaxIterations(int max_iterations)
+{
+    if (max_iterations < 0) {
+        throw std::invalid_argument("pressure initializer max iterations must be non-negative");
+    }
+    pressure_initializer_max_iterations = max_iterations;
+}
+
+void InamuroCUDA::setPressureInitializerCheckInterval(int check_interval)
+{
+    if (check_interval < 0) {
+        throw std::invalid_argument("pressure initializer check interval must be non-negative");
+    }
+    pressure_initializer_check_interval = check_interval;
+}
+
+void InamuroCUDA::setPressureInitializerWaitDir(const std::string& dir, int timeout_ms, int max_step)
+{
+    if (timeout_ms < 0) {
+        throw std::invalid_argument("pressure initializer wait timeout must be non-negative");
+    }
+    if (max_step < 0) {
+        throw std::invalid_argument("pressure initializer wait max step must be non-negative");
+    }
+    pressure_initializer_wait_dir = dir;
+    pressure_initializer_wait_timeout_ms = timeout_ms;
+    pressure_initializer_wait_max_step = max_step;
+}
+
+void InamuroCUDA::setPoissonStateExport(
+    const std::string& dir, const std::set<int>& steps, const std::string& phase)
+{
+    if (phase != "pre" && phase != "post" && phase != "both") {
+        throw std::invalid_argument("Poisson state export phase must be pre, post, or both");
+    }
+    poisson_state_export_dir = dir;
+    poisson_state_export_steps = steps;
+    poisson_state_export_phase = phase;
+}
+
+void InamuroCUDA::loadPressureInitializerForStep(int completed_step)
+{
+    auto step_stem = [](int step) {
+        std::ostringstream name;
+        name << "3D" << std::setfill('0') << std::setw(9) << step;
+        return name.str();
+    };
+
+    const std::filesystem::path dir(pressure_initializer_wait_dir);
+    const std::filesystem::path init_path = dir / (step_stem(completed_step) + ".bin");
+    const std::filesystem::path skip_path = dir / (step_stem(completed_step) + ".skip");
+    const auto start = std::chrono::steady_clock::now();
+
+    while (true) {
+        if (std::filesystem::exists(init_path)) {
+            setPressureInitializer(init_path.string(), pressure_initializer_mode);
+            return;
+        }
+        if (std::filesystem::exists(skip_path)) {
+            setPressureInitializer("", pressure_initializer_mode);
+            return;
+        }
+        if (pressure_initializer_wait_timeout_ms == 0) {
+            setPressureInitializer("", pressure_initializer_mode);
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+        if (elapsed_ms >= pressure_initializer_wait_timeout_ms) {
+            setPressureInitializer("", pressure_initializer_mode);
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+}
+
+void InamuroCUDA::loadPressureInitializer()
+{
+    static constexpr char pressure_magic[8] = {'P', 'I', 'N', 'N', 'P', '1', '\0', '\0'};
+    static constexpr char state_magic[8] = {'P', 'I', 'N', 'N', 'S', '1', '\0', '\0'};
+    std::ifstream in(pressure_initializer_path, std::ios::binary);
+    if (!in) {
+        throw std::runtime_error("failed to open pressure initializer: " + pressure_initializer_path);
+    }
+
+    char magic[8] = {};
+    std::int32_t dims[3] = {};
+    in.read(magic, sizeof(magic));
+    in.read(reinterpret_cast<char*>(dims), sizeof(dims));
+    const bool has_hh = std::memcmp(magic, state_magic, sizeof(magic)) == 0;
+    const bool pressure_only = std::memcmp(magic, pressure_magic, sizeof(magic)) == 0;
+    if (!in || (!pressure_only && !has_hh)) {
+        throw std::runtime_error("invalid pressure initializer header: " + pressure_initializer_path);
+    }
+    if (dims[0] != lx || dims[1] != ly || dims[2] != lz) {
+        throw std::runtime_error("pressure initializer dimensions do not match solver grid");
+    }
+
+    std::vector<double> values(N_cells);
+    in.read(reinterpret_cast<char*>(values.data()), static_cast<std::streamsize>(values.size() * sizeof(double)));
+    if (!in) {
+        throw std::runtime_error("truncated pressure initializer: " + pressure_initializer_path);
+    }
+    for (double value : values) {
+        if (!std::isfinite(value)) {
+            throw std::runtime_error("pressure initializer contains non-finite values");
+        }
+    }
+    std::vector<double> hh_values;
+    if (has_hh) {
+        if (pressure_initializer_mode != "absolute") {
+            throw std::runtime_error("Poisson p+hh state initializer requires absolute mode");
+        }
+        hh_values.resize(static_cast<std::size_t>(N_cells) * Q);
+        in.read(reinterpret_cast<char*>(hh_values.data()),
+                static_cast<std::streamsize>(hh_values.size() * sizeof(double)));
+        if (!in) {
+            throw std::runtime_error("truncated hh state initializer: " + pressure_initializer_path);
+        }
+        for (double value : hh_values) {
+            if (!std::isfinite(value)) {
+                throw std::runtime_error("hh state initializer contains non-finite values");
+            }
+        }
+    }
+
+    if (!gpu.d_pressure_init) {
+        CUDA_CHECK(cudaMalloc(&gpu.d_pressure_init, values.size() * sizeof(double)));
+    }
+    if (!gpu.d_p_backup) {
+        CUDA_CHECK(cudaMalloc(&gpu.d_p_backup, N_macro * sizeof(double)));
+    }
+    if (!gpu.d_hh_backup) {
+        CUDA_CHECK(cudaMalloc(&gpu.d_hh_backup, N_cells * Q * sizeof(double)));
+    }
+    if (!gpu.d_p_prev_backup) {
+        CUDA_CHECK(cudaMalloc(&gpu.d_p_prev_backup, N_cells * sizeof(double)));
+    }
+    if (has_hh && !gpu.d_hh_init) {
+        CUDA_CHECK(cudaMalloc(&gpu.d_hh_init, hh_values.size() * sizeof(double)));
+    }
+    CUDA_CHECK(cudaMemcpy(gpu.d_pressure_init, values.data(), values.size() * sizeof(double), cudaMemcpyHostToDevice));
+    if (has_hh) {
+        CUDA_CHECK(cudaMemcpy(
+            gpu.d_hh_init, hh_values.data(), hh_values.size() * sizeof(double), cudaMemcpyHostToDevice));
+    }
+    pressure_initializer_has_hh = has_hh;
+    pressure_initializer_loaded = true;
+}
+
+void InamuroCUDA::applyPressureInitializer()
+{
+    if (!pressure_initializer_loaded) {
+        return;
+    }
+
+    auto start = std::chrono::steady_clock::now();
+    const int threads = 256;
+    const int blocks = (N_cells + threads - 1) / threads;
+    const int is_delta = (pressure_initializer_mode == "delta") ? 1 : 0;
+    applyPressureInitializerKernel<<<blocks, threads>>>(
+        gpu.d_p, gpu.d_pressure_init, lx, ly, lz, lz_total, is_delta);
+    CUDA_CHECK(cudaGetLastError());
+
+    if (pressure_initializer_has_hh) {
+        CUDA_CHECK(cudaMemcpy(
+            gpu.d_hh, gpu.d_hh_init,
+            static_cast<std::size_t>(N_cells) * Q * sizeof(double),
+            cudaMemcpyDeviceToDevice));
+    } else {
+        dim3 block3(8, 8, 8);
+        dim3 grid3((lx + block3.x - 1) / block3.x,
+                   (ly + block3.y - 1) / block3.y,
+                   (lz + block3.z - 1) / block3.z);
+        updateHHKernel<<<grid3, block3>>>(gpu.d_hh, gpu.d_p, lx, ly, lz, lz_total);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    seedPressureResidualFromCurrentPressure();
+    auto end = std::chrono::steady_clock::now();
+    perf.pressure_initializer_time +=
+        std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+void InamuroCUDA::seedPressureResidualFromCurrentPressure()
+{
+    const int threads = 256;
+    const int blocks = (N_cells + threads - 1) / threads;
+    seedPressurePrevKernel<<<blocks, threads>>>(gpu.d_p, gpu.d_p_prev, lx, ly, lz, lz_total);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void InamuroCUDA::writePoissonDiagnostic(
     int step,
     int iteration,
@@ -2103,6 +2610,18 @@ void InamuroCUDA::printPerformanceMetrics() const
     std::cout << "Poisson two-grid correction: "
               << (use_poisson_two_grid_correction ? "enabled" : "disabled")
               << ", strength=" << poisson_two_grid_strength << std::endl;
+    const bool pressure_initializer_was_used =
+        pressure_initializer_loaded || perf.pressure_initializer_attempts > 0;
+    std::cout << "PINN pressure initializer: "
+              << (pressure_initializer_was_used ? "enabled" : "disabled")
+              << ", mode=" << pressure_initializer_mode
+              << ", max_iterations="
+              << (pressure_initializer_max_iterations > 0 ? pressure_initializer_max_iterations : 1000)
+              << ", check_interval="
+              << (pressure_initializer_check_interval > 0 ? pressure_initializer_check_interval : poisson_check_interval)
+              << ", attempts=" << perf.pressure_initializer_attempts
+              << ", accepts=" << perf.pressure_initializer_accepts
+              << ", fallbacks=" << perf.pressure_initializer_fallbacks << std::endl;
     std::cout << "\nAverage time per kernel (ms):" << std::endl;
     std::cout << "  Collision:      " << perf.total_collision_time / perf.time_step_count << std::endl;
     std::cout << "  Stream:         " << perf.total_stream_time / perf.time_step_count << std::endl;
@@ -2122,6 +2641,7 @@ void InamuroCUDA::printPerformanceMetrics() const
         perf.poisson_onepass_time +
         perf.poisson_scalar_time +
         perf.poisson_init_time +
+        perf.pressure_initializer_time +
         perf.poisson_boundary_time + perf.poisson_pressure_time +
         perf.poisson_boundary_pressure_time + perf.poisson_residual_time;
     if (avg_iters > 0.0 && detail_total > 0.0) {
@@ -2132,6 +2652,7 @@ void InamuroCUDA::printPerformanceMetrics() const
         std::cout << "  pressure onepass:   " << perf.poisson_onepass_time / perf.time_step_count << std::endl;
         std::cout << "  pressure scalar:    " << perf.poisson_scalar_time / perf.time_step_count << std::endl;
         std::cout << "  hh init:            " << perf.poisson_init_time / perf.time_step_count << std::endl;
+        std::cout << "  PINN p init:        " << perf.pressure_initializer_time / perf.time_step_count << std::endl;
         std::cout << "  pressure boundary:  " << perf.poisson_boundary_time / perf.time_step_count << std::endl;
         std::cout << "  pressure sum:       " << perf.poisson_pressure_time / perf.time_step_count << std::endl;
         std::cout << "  boundary+sum fused: " << perf.poisson_boundary_pressure_time / perf.time_step_count << std::endl;
@@ -2143,6 +2664,7 @@ void InamuroCUDA::printPerformanceMetrics() const
         std::cout << "  pressure onepass:   " << perf.poisson_onepass_time * 1000.0 / perf.total_poisson_iterations << std::endl;
         std::cout << "  pressure scalar:    " << perf.poisson_scalar_time * 1000.0 / perf.total_poisson_iterations << std::endl;
         std::cout << "  hh init:            " << perf.poisson_init_time * 1000.0 / perf.total_poisson_iterations << std::endl;
+        std::cout << "  PINN p init:        " << perf.pressure_initializer_time * 1000.0 / perf.total_poisson_iterations << std::endl;
         std::cout << "  pressure boundary:  " << perf.poisson_boundary_time * 1000.0 / perf.total_poisson_iterations << std::endl;
         std::cout << "  pressure sum:       " << perf.poisson_pressure_time * 1000.0 / perf.total_poisson_iterations << std::endl;
         std::cout << "  boundary+sum fused: " << perf.poisson_boundary_pressure_time * 1000.0 / perf.total_poisson_iterations << std::endl;
@@ -2203,6 +2725,230 @@ void InamuroCUDA::resetPerformanceMetrics()
     perf.poisson_pressure_time = 0.0;
     perf.poisson_boundary_pressure_time = 0.0;
     perf.poisson_residual_time = 0.0;
+    perf.pressure_initializer_time = 0.0;
     perf.total_poisson_iterations = 0;
+    perf.pressure_initializer_attempts = 0;
+    perf.pressure_initializer_accepts = 0;
+    perf.pressure_initializer_fallbacks = 0;
     perf.time_step_count = 0;
+}
+
+BookPressureStages runBookPressureStagesGPU(
+    int lx, int ly, int lz,
+    const std::vector<double>& hh,
+    const std::vector<double>& pressure,
+    const std::vector<double>& rho,
+    const std::vector<double>& u,
+    const std::vector<double>& v,
+    const std::vector<double>& w)
+{
+    const int n = lx * ly * lz;
+    const int lztot = lz + 2;
+    const int nmacro = lx * ly * lztot;
+    if (static_cast<int>(hh.size()) != n * 15 ||
+        static_cast<int>(pressure.size()) != n || static_cast<int>(rho.size()) != n ||
+        static_cast<int>(u.size()) != n || static_cast<int>(v.size()) != n ||
+        static_cast<int>(w.size()) != n) {
+        throw std::invalid_argument("book pressure test input size mismatch");
+    }
+
+    upload_lattice_constants();
+    std::vector<double> macro_p(nmacro, 0.0), macro_rho(nmacro, 0.0);
+    std::vector<double> macro_u(nmacro, 0.0), macro_v(nmacro, 0.0), macro_w(nmacro, 0.0);
+    const int offset = lx * ly;
+    std::copy(pressure.begin(), pressure.end(), macro_p.begin() + offset);
+    std::copy(rho.begin(), rho.end(), macro_rho.begin() + offset);
+    std::copy(u.begin(), u.end(), macro_u.begin() + offset);
+    std::copy(v.begin(), v.end(), macro_v.begin() + offset);
+    std::copy(w.begin(), w.end(), macro_w.begin() + offset);
+
+    double *d_hh = nullptr, *d_tmp = nullptr, *d_p = nullptr, *d_rho = nullptr;
+    double *d_u = nullptr, *d_v = nullptr, *d_w = nullptr;
+    double *d_ux = nullptr, *d_uy = nullptr, *d_uz = nullptr;
+    double *d_vx = nullptr, *d_vy = nullptr, *d_vz = nullptr;
+    double *d_wx = nullptr, *d_wy = nullptr, *d_wz = nullptr;
+    auto free_all = [&]() {
+        cudaFree(d_hh); cudaFree(d_tmp); cudaFree(d_p); cudaFree(d_rho);
+        cudaFree(d_u); cudaFree(d_v); cudaFree(d_w);
+        cudaFree(d_ux); cudaFree(d_uy); cudaFree(d_uz);
+        cudaFree(d_vx); cudaFree(d_vy); cudaFree(d_vz);
+        cudaFree(d_wx); cudaFree(d_wy); cudaFree(d_wz);
+    };
+
+    try {
+        const std::size_t dist_bytes = static_cast<std::size_t>(n) * 15 * sizeof(double);
+        const std::size_t cell_bytes = static_cast<std::size_t>(n) * sizeof(double);
+        const std::size_t macro_bytes = static_cast<std::size_t>(nmacro) * sizeof(double);
+        CUDA_CHECK(cudaMalloc(&d_hh, dist_bytes));
+        CUDA_CHECK(cudaMalloc(&d_tmp, dist_bytes));
+        CUDA_CHECK(cudaMalloc(&d_p, macro_bytes));
+        CUDA_CHECK(cudaMalloc(&d_rho, macro_bytes));
+        CUDA_CHECK(cudaMalloc(&d_u, macro_bytes));
+        CUDA_CHECK(cudaMalloc(&d_v, macro_bytes));
+        CUDA_CHECK(cudaMalloc(&d_w, macro_bytes));
+        CUDA_CHECK(cudaMalloc(&d_ux, cell_bytes)); CUDA_CHECK(cudaMalloc(&d_uy, cell_bytes)); CUDA_CHECK(cudaMalloc(&d_uz, cell_bytes));
+        CUDA_CHECK(cudaMalloc(&d_vx, cell_bytes)); CUDA_CHECK(cudaMalloc(&d_vy, cell_bytes)); CUDA_CHECK(cudaMalloc(&d_vz, cell_bytes));
+        CUDA_CHECK(cudaMalloc(&d_wx, cell_bytes)); CUDA_CHECK(cudaMalloc(&d_wy, cell_bytes)); CUDA_CHECK(cudaMalloc(&d_wz, cell_bytes));
+        CUDA_CHECK(cudaMemcpy(d_hh, hh.data(), dist_bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_p, macro_p.data(), macro_bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_rho, macro_rho.data(), macro_bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_u, macro_u.data(), macro_bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_v, macro_v.data(), macro_bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_w, macro_w.data(), macro_bytes, cudaMemcpyHostToDevice));
+
+        dim3 block(8, 8, 8);
+        dim3 grid((lx + block.x - 1) / block.x,
+                  (ly + block.y - 1) / block.y,
+                  (lz + block.z - 1) / block.z);
+        dim3 block2d(16, 16);
+        dim3 grid2d((ly + block2d.x - 1) / block2d.x,
+                    (lz + block2d.y - 1) / block2d.y);
+        gradientKernel<<<grid, block>>>(d_u, d_ux, d_uy, d_uz, lx, ly, lz, lztot, true);
+        gradientKernel<<<grid, block>>>(d_v, d_vx, d_vy, d_vz, lx, ly, lz, lztot, true);
+        gradientKernel<<<grid, block>>>(d_w, d_wx, d_wy, d_wz, lx, ly, lz, lztot, true);
+        CUDA_CHECK(cudaGetLastError());
+
+        BookPressureStages result;
+        std::vector<double> ux(n), vy(n), wz(n);
+        CUDA_CHECK(cudaMemcpy(ux.data(), d_ux, cell_bytes, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(vy.data(), d_vy, cell_bytes, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(wz.data(), d_wz, cell_bytes, cudaMemcpyDeviceToHost));
+        result.divergence.resize(n);
+        for (int i = 0; i < n; ++i) result.divergence[i] = ux[i] + vy[i] + wz[i];
+
+        collisionPressureKernel<<<grid, block>>>(
+            d_hh, d_p, d_rho, d_ux, d_vy, d_wz, lx, ly, lz, lztot, 1.0);
+        CUDA_CHECK(cudaGetLastError());
+        result.collision.resize(static_cast<std::size_t>(n) * 15);
+        CUDA_CHECK(cudaMemcpy(result.collision.data(), d_hh, dist_bytes, cudaMemcpyDeviceToHost));
+
+        streamKernel<<<grid, block>>>(d_hh, d_tmp, lx, ly, lz);
+        CUDA_CHECK(cudaGetLastError());
+        result.streamed.resize(static_cast<std::size_t>(n) * 15);
+        CUDA_CHECK(cudaMemcpy(result.streamed.data(), d_tmp, dist_bytes, cudaMemcpyDeviceToHost));
+
+        slipBounceBackKernel<<<grid2d, block2d>>>(d_tmp, lx, ly, lz);
+        CUDA_CHECK(cudaGetLastError());
+        result.bounced.resize(static_cast<std::size_t>(n) * 15);
+        CUDA_CHECK(cudaMemcpy(result.bounced.data(), d_tmp, dist_bytes, cudaMemcpyDeviceToHost));
+
+        computePressureKernel<<<grid, block>>>(d_tmp, d_p, lx, ly, lz, lztot);
+        CUDA_CHECK(cudaGetLastError());
+        result.pressure.resize(n);
+        CUDA_CHECK(cudaMemcpy(
+            result.pressure.data(), d_p + offset, cell_bytes, cudaMemcpyDeviceToHost));
+        free_all();
+        return result;
+    } catch (...) {
+        free_all();
+        throw;
+    }
+}
+
+BookPressureSolution solveBookPressureGPU(
+    int lx, int ly, int lz,
+    const std::vector<double>& hh,
+    const std::vector<double>& pressure,
+    const std::vector<double>& rho,
+    const std::vector<double>& u,
+    const std::vector<double>& v,
+    const std::vector<double>& w,
+    const std::vector<double>& divergence,
+    int max_iterations,
+    int check_interval,
+    double tolerance)
+{
+    const int n = lx * ly * lz;
+    const int lztot = lz + 2;
+    const int nmacro = lx * ly * lztot;
+    if (static_cast<int>(hh.size()) != n * 15 || static_cast<int>(pressure.size()) != n ||
+        static_cast<int>(rho.size()) != n || static_cast<int>(u.size()) != n ||
+        static_cast<int>(v.size()) != n || static_cast<int>(w.size()) != n ||
+        static_cast<int>(divergence.size()) != n ||
+        max_iterations <= 0 || check_interval <= 0 || tolerance <= 0.0) {
+        throw std::invalid_argument("invalid book pressure replay input");
+    }
+    upload_lattice_constants();
+    const int offset = lx * ly;
+    std::vector<double> macro_p(nmacro, 0.0), macro_rho(nmacro, 0.0);
+    std::vector<double> macro_u(nmacro, 0.0), macro_v(nmacro, 0.0), macro_w(nmacro, 0.0);
+    std::copy(pressure.begin(), pressure.end(), macro_p.begin() + offset);
+    std::copy(rho.begin(), rho.end(), macro_rho.begin() + offset);
+    std::copy(u.begin(), u.end(), macro_u.begin() + offset);
+    std::copy(v.begin(), v.end(), macro_v.begin() + offset);
+    std::copy(w.begin(), w.end(), macro_w.begin() + offset);
+
+    double *d_ha = nullptr, *d_hb = nullptr, *d_p = nullptr, *d_rho = nullptr;
+    double *d_u = nullptr, *d_v = nullptr, *d_w = nullptr;
+    double *d_ux = nullptr, *d_uy = nullptr, *d_uz = nullptr;
+    double *d_vx = nullptr, *d_vy = nullptr, *d_vz = nullptr;
+    double *d_wx = nullptr, *d_wy = nullptr, *d_wz = nullptr;
+    auto cleanup = [&]() {
+        cudaFree(d_ha); cudaFree(d_hb); cudaFree(d_p); cudaFree(d_rho);
+        cudaFree(d_u); cudaFree(d_v); cudaFree(d_w);
+        cudaFree(d_ux); cudaFree(d_uy); cudaFree(d_uz);
+        cudaFree(d_vx); cudaFree(d_vy); cudaFree(d_vz);
+        cudaFree(d_wx); cudaFree(d_wy); cudaFree(d_wz);
+    };
+    try {
+        const std::size_t dist_bytes = static_cast<std::size_t>(n) * 15 * sizeof(double);
+        const std::size_t cell_bytes = static_cast<std::size_t>(n) * sizeof(double);
+        const std::size_t macro_bytes = static_cast<std::size_t>(nmacro) * sizeof(double);
+        CUDA_CHECK(cudaMalloc(&d_ha, dist_bytes)); CUDA_CHECK(cudaMalloc(&d_hb, dist_bytes));
+        CUDA_CHECK(cudaMalloc(&d_p, macro_bytes)); CUDA_CHECK(cudaMalloc(&d_rho, macro_bytes));
+        CUDA_CHECK(cudaMalloc(&d_u, macro_bytes)); CUDA_CHECK(cudaMalloc(&d_v, macro_bytes)); CUDA_CHECK(cudaMalloc(&d_w, macro_bytes));
+        CUDA_CHECK(cudaMalloc(&d_ux, cell_bytes)); CUDA_CHECK(cudaMalloc(&d_uy, cell_bytes)); CUDA_CHECK(cudaMalloc(&d_uz, cell_bytes));
+        CUDA_CHECK(cudaMalloc(&d_vx, cell_bytes)); CUDA_CHECK(cudaMalloc(&d_vy, cell_bytes)); CUDA_CHECK(cudaMalloc(&d_vz, cell_bytes));
+        CUDA_CHECK(cudaMalloc(&d_wx, cell_bytes)); CUDA_CHECK(cudaMalloc(&d_wy, cell_bytes)); CUDA_CHECK(cudaMalloc(&d_wz, cell_bytes));
+        CUDA_CHECK(cudaMemcpy(d_ha, hh.data(), dist_bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_p, macro_p.data(), macro_bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_rho, macro_rho.data(), macro_bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_u, macro_u.data(), macro_bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_v, macro_v.data(), macro_bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_w, macro_w.data(), macro_bytes, cudaMemcpyHostToDevice));
+        dim3 block(8, 8, 8);
+        dim3 grid((lx + block.x - 1) / block.x, (ly + block.y - 1) / block.y, (lz + block.z - 1) / block.z);
+        dim3 block2d(16, 16);
+        dim3 grid2d((ly + block2d.x - 1) / block2d.x, (lz + block2d.y - 1) / block2d.y);
+        CUDA_CHECK(cudaMemcpy(d_ux, divergence.data(), cell_bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemset(d_vy, 0, cell_bytes));
+        CUDA_CHECK(cudaMemset(d_wz, 0, cell_bytes));
+
+        BookPressureSolution solution;
+        std::vector<double> previous = pressure;
+        std::vector<double> current(n);
+        for (int iteration = 1; iteration <= max_iterations; ++iteration) {
+            collisionPressureKernel<<<grid, block>>>(d_ha, d_p, d_rho, d_ux, d_vy, d_wz, lx, ly, lz, lztot, 1.0);
+            streamKernel<<<grid, block>>>(d_ha, d_hb, lx, ly, lz);
+            std::swap(d_ha, d_hb);
+            slipBounceBackKernel<<<grid2d, block2d>>>(d_ha, lx, ly, lz);
+            computePressureKernel<<<grid, block>>>(d_ha, d_p, lx, ly, lz, lztot);
+            CUDA_CHECK(cudaGetLastError());
+            if (iteration % check_interval == 0 || iteration == max_iterations) {
+                CUDA_CHECK(cudaMemcpy(current.data(), d_p + offset, cell_bytes, cudaMemcpyDeviceToHost));
+                double err1 = 0.0, err2 = 0.0;
+                for (int i = 0; i < n; ++i) {
+                    err1 += std::abs(current[i] - previous[i]);
+                    err2 += std::abs(current[i]);
+                }
+                previous = current;
+                solution.relative_error = err2 > 0.0 ? err1 / err2 : 0.0;
+                if (solution.relative_error < tolerance) {
+                    solution.iterations = iteration;
+                    solution.converged = true;
+                    break;
+                }
+            }
+            solution.iterations = iteration;
+        }
+        solution.pressure.resize(n);
+        solution.hh.resize(static_cast<std::size_t>(n) * 15);
+        CUDA_CHECK(cudaMemcpy(solution.pressure.data(), d_p + offset, cell_bytes, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(solution.hh.data(), d_ha, dist_bytes, cudaMemcpyDeviceToHost));
+        cleanup();
+        return solution;
+    } catch (...) {
+        cleanup();
+        throw;
+    }
 }

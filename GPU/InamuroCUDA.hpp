@@ -2,6 +2,7 @@
 #include "Inamuro.hpp"
 #include <cuda_runtime.h>
 #include <stdexcept>
+#include <set>
 #include <string>
 #include <vector>
 #include <iostream>
@@ -28,6 +29,11 @@ public:
 
     // 单步时间推进（GPU 版本）——基线：宏观量 + 示例 streaming，其余留空壳供后续逐步替换
     void performTimeStepGPU();
+    void performTimeStepGPUWithPoissonPair(Inamuro& cpuSolver, int completed_step,
+                                           const std::string& pair_output_dir,
+                                           const std::string& pair_format = "tecplot",
+                                           bool write_pre_pair = true,
+                                           bool write_post_pair = true);
 
     // 将 GPU 上的宏观量下载回 CPU Inamuro（用于输出/对比）
     void downloadFieldsToCPU(Inamuro& cpuSolver) const;
@@ -51,6 +57,11 @@ public:
     void setPoissonConvergence(int check_interval, double tolerance);
     void setPoissonDiagnosticsPath(const std::string& path);
     void setUsePoissonSpatialDiagnostics(bool enabled);
+    void setPressureInitializer(const std::string& path, const std::string& mode);
+    void setPressureInitializerMaxIterations(int max_iterations);
+    void setPressureInitializerCheckInterval(int check_interval);
+    void setPressureInitializerWaitDir(const std::string& dir, int timeout_ms, int max_step);
+    void setPoissonStateExport(const std::string& dir, const std::set<int>& steps, const std::string& phase);
     void printPerformanceMetrics() const;
     void printRooflineSummary() const;
     void resetPerformanceMetrics();
@@ -92,7 +103,11 @@ private:
         double poisson_pressure_time = 0.0;
         double poisson_boundary_pressure_time = 0.0;
         double poisson_residual_time = 0.0;
+        double pressure_initializer_time = 0.0;
         int total_poisson_iterations = 0;    // 压力泊松总迭代次数
+        int pressure_initializer_attempts = 0;
+        int pressure_initializer_accepts = 0;
+        int pressure_initializer_fallbacks = 0;
         int time_step_count = 0;             // 时间步计数
     } perf;
     
@@ -117,6 +132,18 @@ private:
     double poisson_anderson_beta_max = 1.0;
     double poisson_two_grid_strength = 0.5;
     std::string poisson_diagnostics_path;
+    std::string pressure_initializer_path;
+    std::string pressure_initializer_mode = "absolute";
+    std::string pressure_initializer_wait_dir;
+    std::string poisson_state_export_dir;
+    std::set<int> poisson_state_export_steps;
+    std::string poisson_state_export_phase = "pre";
+    int pressure_initializer_wait_timeout_ms = 0;
+    int pressure_initializer_wait_max_step = 0;
+    bool pressure_initializer_loaded = false;
+    bool pressure_initializer_has_hh = false;
+    int pressure_initializer_max_iterations = 0;
+    int pressure_initializer_check_interval = 0;
 
     cudaGraph_t poisson_graph = nullptr;
     cudaGraphExec_t poisson_graph_exec = nullptr;
@@ -128,6 +155,24 @@ private:
                                 double pressure_l1_norm, double relative_error,
                                 bool converged, double block_low_frequency_fraction,
                                 int block_size, int block_count) const;
+    void loadPressureInitializer();
+    void loadPressureInitializerForStep(int completed_step);
+    void applyPressureInitializer();
+    void seedPressureResidualFromCurrentPressure();
+    void performTimeStepGPUImpl(Inamuro* pair_solver, int completed_step,
+                                const std::string* pair_output_dir,
+                                const std::string& pair_format,
+                                bool write_pre_pair,
+                                bool write_post_pair);
+    void writePoissonPairSnapshot(Inamuro& cpuSolver, int completed_step,
+                                  const std::string& pair_output_dir,
+                                  const std::string& phase) const;
+    void writePoissonFeatureSnapshot(int completed_step,
+                                     const std::string& pair_output_dir,
+                                     const std::string& phase) const;
+    void writePoissonStateSnapshot(int completed_step,
+                                   const std::string& pair_output_dir,
+                                   const std::string& phase) const;
 
     // ------------ 设备端字段 ------------
     struct GPUMemory
@@ -161,6 +206,11 @@ private:
 
         double* d_p_prev = nullptr;
         double* d_pressure_error = nullptr;
+        double* d_pressure_init = nullptr;
+        double* d_hh_init = nullptr;
+        double* d_p_backup = nullptr;
+        double* d_hh_backup = nullptr;
+        double* d_p_prev_backup = nullptr;
         double* d_anderson_prev_residual = nullptr;
         double* d_anderson_prev_image = nullptr;
         double* d_anderson_stats = nullptr;

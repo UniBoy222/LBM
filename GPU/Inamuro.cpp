@@ -444,6 +444,19 @@ void Inamuro::getGridSize(int& nx, int& ny, int& nz) const
     nz = lz;
 }
 
+void Inamuro::setOutputDirectory(const std::string& output_dir)
+{
+    output_config.output_dir = output_dir;
+    if (!output_config.output_dir.empty() && output_config.output_dir.back() != '/') {
+        output_config.output_dir.push_back('/');
+    }
+}
+
+std::string Inamuro::getOutputDirectory() const
+{
+    return output_config.output_dir;
+}
+
 // === 算法实现方法 ===
 
 void Inamuro::initializeArrays()

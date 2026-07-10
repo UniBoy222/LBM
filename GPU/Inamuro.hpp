@@ -93,6 +93,8 @@ public:
 
     // === 数据访问接口 ===
     void getGridSize(int& nx, int& ny, int& nz) const override;
+    void setOutputDirectory(const std::string& output_dir);
+    std::string getOutputDirectory() const;
 
 private:
     template <typename T>

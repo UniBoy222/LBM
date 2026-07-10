@@ -31,6 +31,9 @@ struct CompareConfig {
     bool poisson_graph = false;
     std::string poisson_diagnostics;
     bool poisson_spatial_diagnostics = false;
+    std::string pressure_init_file;
+    std::string pressure_init_mode = "absolute";
+    int pressure_init_max_iterations = 0;
     double tolerance = 1.0e-8;
     double pressure_tolerance = 1.0e-8;
 };
@@ -54,6 +57,8 @@ void print_usage(const char* argv0)
         << "       [--poisson-two-grid-correction] [--poisson-two-grid-strength X]\n"
         << "       [--poisson-graph] [--poisson-diagnostics CSV]\n"
         << "       [--poisson-spatial-diagnostics]\n"
+        << "       [--pressure-init-file FILE] [--pressure-init-mode absolute|delta]\n"
+        << "       [--pressure-init-max-iterations N]\n"
         << "       [--tolerance X] [--pressure-tolerance X]\n";
 }
 
@@ -108,6 +113,12 @@ CompareConfig parse_args(int argc, char** argv)
             cfg.poisson_diagnostics = require_value(arg);
         } else if (arg == "--poisson-spatial-diagnostics") {
             cfg.poisson_spatial_diagnostics = true;
+        } else if (arg == "--pressure-init-file") {
+            cfg.pressure_init_file = require_value(arg);
+        } else if (arg == "--pressure-init-mode") {
+            cfg.pressure_init_mode = require_value(arg);
+        } else if (arg == "--pressure-init-max-iterations") {
+            cfg.pressure_init_max_iterations = std::stoi(require_value(arg));
         } else if (arg == "--tolerance") {
             cfg.tolerance = std::stod(require_value(arg));
         } else if (arg == "--pressure-tolerance") {
@@ -139,6 +150,12 @@ CompareConfig parse_args(int argc, char** argv)
     }
     if (!(cfg.poisson_two_grid_strength >= 0.0)) {
         throw std::runtime_error("--poisson-two-grid-strength must be non-negative");
+    }
+    if (cfg.pressure_init_mode != "absolute" && cfg.pressure_init_mode != "delta") {
+        throw std::runtime_error("--pressure-init-mode must be absolute or delta");
+    }
+    if (cfg.pressure_init_max_iterations < 0) {
+        throw std::runtime_error("--pressure-init-max-iterations must be non-negative");
     }
     return cfg;
 }
@@ -232,6 +249,8 @@ int main(int argc, char** argv)
         gpu.setPoissonConvergence(cfg.poisson_check_interval, cfg.poisson_tolerance);
         gpu.setPoissonDiagnosticsPath(cfg.poisson_diagnostics);
         gpu.setUsePoissonSpatialDiagnostics(cfg.poisson_spatial_diagnostics);
+        gpu.setPressureInitializerMaxIterations(cfg.pressure_init_max_iterations);
+        gpu.setPressureInitializer(cfg.pressure_init_file, cfg.pressure_init_mode);
 
         for (int step = 0; step < cfg.steps; ++step) {
             cpu.performTimeStep();
@@ -255,6 +274,9 @@ int main(int argc, char** argv)
                   << " poisson_two_grid_strength=" << cfg.poisson_two_grid_strength
                   << " poisson_diagnostics=" << (cfg.poisson_diagnostics.empty() ? "none" : cfg.poisson_diagnostics)
                   << " poisson_spatial_diagnostics=" << (cfg.poisson_spatial_diagnostics ? "yes" : "no")
+                  << " pressure_init=" << (cfg.pressure_init_file.empty() ? "none" : cfg.pressure_init_file)
+                  << " pressure_init_mode=" << cfg.pressure_init_mode
+                  << " pressure_init_max_iterations=" << cfg.pressure_init_max_iterations
                   << " params=" << cfg.params << std::endl;
         std::cout << std::scientific << std::setprecision(6);
         std::cout << "field,max_abs,relative_l2,status\n";

@@ -39,3 +39,7 @@ Thumbs.db
 # CUDA 编译文件
 *.ptx
 *.cubin
+GPU/lbm_gpu
+GPU/lbm_compare
+GPU/book_pressure_step_test
+GPU/book_pressure_replay
