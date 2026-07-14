@@ -1,0 +1,11 @@
+{
+  "route": "baseline",
+  "requested_steps": 20,
+  "passed_steps": 20,
+  "total_iterations": 130600,
+  "all_first_check": false,
+  "max_field_rel": 0.00000000000000000e+00,
+  "max_restore_abs": 0.00000000000000000e+00,
+  "qualification_pass": true,
+  "go": false
+}

@@ -43,6 +43,7 @@ struct RunConfig {
     bool poisson_fixed_point_shadow = false;
     bool poisson_dual_residual = false;
     std::string poisson_diagnostics;
+    std::string poisson_fixed_point_dump_dir;
     bool poisson_spatial_diagnostics = false;
 };
 
@@ -60,6 +61,7 @@ void print_usage(const char* argv0)
         << "       [--poisson-two-grid-correction] [--poisson-two-grid-strength X]\n"
         << "       [--output-frequency N] [--output-steps A,B,C]\n"
         << "       [--poisson-graph] [--poisson-detail] [--poisson-diagnostics CSV]\n"
+        << "       [--poisson-fixed-point-dump-dir DIR] (experiment branch audit only)\n"
         << "       [--poisson-deterministic-reductions]\n"
         << "       [--poisson-fixed-point-shadow] [--poisson-dual-residual]\n"
         << "       [--poisson-spatial-diagnostics]\n"
@@ -190,6 +192,8 @@ RunConfig parse_args(int argc, char** argv)
             cfg.poisson_deterministic_reductions = true;
         } else if (arg == "--poisson-diagnostics") {
             cfg.poisson_diagnostics = require_value(arg);
+        } else if (arg == "--poisson-fixed-point-dump-dir") {
+            cfg.poisson_fixed_point_dump_dir = require_value(arg);
         } else if (arg == "--poisson-spatial-diagnostics") {
             cfg.poisson_spatial_diagnostics = true;
         } else if (arg == "--no-roofline") {
@@ -305,6 +309,8 @@ int main(int argc, char** argv)
                   << " poisson_two_grid_correction=" << (cfg.poisson_two_grid_correction ? "yes" : "no")
                   << " poisson_two_grid_strength=" << cfg.poisson_two_grid_strength
                   << " poisson_diagnostics=" << (cfg.poisson_diagnostics.empty() ? "none" : cfg.poisson_diagnostics)
+                  << " poisson_fixed_point_dump_dir="
+                  << (cfg.poisson_fixed_point_dump_dir.empty() ? "none" : cfg.poisson_fixed_point_dump_dir)
                   << " poisson_spatial_diagnostics=" << (cfg.poisson_spatial_diagnostics ? "yes" : "no")
                   << " params=" << cfg.params
                   << " steps=" << cfg.steps
@@ -353,6 +359,7 @@ int main(int argc, char** argv)
         gpu.setPoissonConvergence(cfg.poisson_check_interval, cfg.poisson_tolerance);
         gpu.setPoissonIterationLimit(cfg.poisson_iteration_limit);
         gpu.setPoissonDiagnosticsPath(cfg.poisson_diagnostics);
+        gpu.setPoissonFixedPointDumpDirectory(cfg.poisson_fixed_point_dump_dir);
         gpu.setUsePoissonSpatialDiagnostics(cfg.poisson_spatial_diagnostics);
         const double ms = run_loop(solver, cfg, [&](bool need_output) {
             gpu.performTimeStepGPU();

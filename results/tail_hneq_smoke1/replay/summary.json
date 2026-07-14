@@ -1,0 +1,11 @@
+{
+  "route": "replay",
+  "requested_steps": 1,
+  "passed_steps": 1,
+  "total_iterations": 100,
+  "all_first_check": true,
+  "max_field_rel": 6.26301929479308108e-16,
+  "max_restore_abs": 1.38777878078144568e-16,
+  "qualification_pass": true,
+  "go": false
+}

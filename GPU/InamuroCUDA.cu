@@ -1,10 +1,14 @@
 #include "InamuroCUDA.hpp"
+#include <array>
 #include <cmath>
 #include <algorithm>
 #include <chrono>
+#include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <sstream>
 #include <utility>
 
 // 简单错误检查宏
@@ -43,6 +47,87 @@ static void checkedAccumulate(
     }
     total += value;
 }
+
+namespace {
+
+constexpr std::array<double, 15> kTailEi = {
+    2.0 / 9.0,
+    1.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0,
+    1.0 / 9.0, 1.0 / 9.0, 1.0 / 9.0,
+    1.0 / 72.0, 1.0 / 72.0, 1.0 / 72.0, 1.0 / 72.0,
+    1.0 / 72.0, 1.0 / 72.0, 1.0 / 72.0, 1.0 / 72.0
+};
+
+#pragma pack(push, 1)
+struct TailHneqFileHeader
+{
+    char magic[8];
+    std::uint32_t version;
+    std::uint32_t header_bytes;
+    std::uint32_t lx;
+    std::uint32_t ly;
+    std::uint32_t lz;
+    std::uint32_t directions;
+    std::uint32_t step;
+    std::uint32_t check_interval;
+    std::uint32_t active_phase;
+    std::uint32_t reserved;
+    std::uint32_t endian_tag;
+    std::uint32_t float_bytes;
+    std::uint32_t layout_id;
+    std::uint64_t reference_iterations;
+    std::uint64_t tail_iteration;
+    std::uint64_t cells;
+    std::uint64_t pressure_values;
+    std::uint64_t hneq_values;
+    std::uint64_t pressure_cache_values;
+    std::uint64_t payload_bytes;
+    std::uint64_t payload_fnv1a64;
+    double tolerance;
+    double gauge_target;
+    double source_mean;
+    double source_abs_mean;
+    double projected_source_mean;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(TailHneqFileHeader) == 164,
+              "tail+hneq artifact header layout changed");
+
+constexpr char kTailHneqMagic[8] = {'C', 'L', 'B', 'T', 'H', 'N', '1', '\0'};
+constexpr std::uint32_t kTailHneqVersion = 1;
+constexpr std::uint32_t kTailEndianTag = 0x01020304U;
+// physical p[cell], cell-major hneq[cell][q], physical p_prev[cell]
+constexpr std::uint32_t kTailLayoutId = 0x00010001U;
+
+std::uint64_t fnv1a64(const void* data, std::size_t bytes,
+                      std::uint64_t hash = 14695981039346656037ULL)
+{
+    const auto* p = static_cast<const unsigned char*>(data);
+    for (std::size_t i = 0; i < bytes; ++i) {
+        hash ^= static_cast<std::uint64_t>(p[i]);
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+bool metadataCompatible(double actual, double recorded)
+{
+    if (!std::isfinite(actual) || !std::isfinite(recorded)) return false;
+    const double scale = std::max({1.0, std::abs(actual), std::abs(recorded)});
+    return std::abs(actual - recorded) <= 1.0e-10 * scale;
+}
+
+std::filesystem::path tailHneqPath(const std::string& directory,
+                                   std::uint32_t step)
+{
+    std::ostringstream name;
+    name << "tail_hneq_step" << std::setw(4) << std::setfill('0') << step
+         << ".bin";
+    return std::filesystem::path(directory) / name.str();
+}
+
+} // namespace
 
 // -------------------- D3Q15 方向与权重（常量内存） --------------------
 // 与 CPU 版本 D3Q15 保持完全一致
@@ -604,6 +689,73 @@ __global__ void computePressureKernel(
     p[macro_idx] = p_sum;
 }
 
+__global__ void injectOraclePressureOnlyKernel(
+    const double* __restrict__ oracle_pressure,
+    double* __restrict__ p,
+    int lx, int ly, int lz, int lztot)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int z = blockIdx.z * blockDim.z + threadIdx.z;
+    if (x >= lx || y >= ly || z >= lz) return;
+
+    const int cell = (z * ly + y) * lx + x;
+    const int macro_idx = ((z + 1) * ly + y) * lx + x;
+    p[macro_idx] = oracle_pressure[cell];
+}
+
+__global__ void injectOraclePressureAndHHKernel(
+    const double* __restrict__ oracle_pressure,
+    double* __restrict__ p,
+    double* __restrict__ hh,
+    int lx, int ly, int lz, int lztot)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int z = blockIdx.z * blockDim.z + threadIdx.z;
+    if (x >= lx || y >= ly || z >= lz) return;
+
+    const int cell = (z * ly + y) * lx + x;
+    const int macro_idx = ((z + 1) * ly + y) * lx + x;
+    const double value = oracle_pressure[cell];
+    p[macro_idx] = value;
+    for (int q = 0; q < 15; ++q) {
+        hh[cell * 15 + q] = c_Ei[q] * value;
+    }
+}
+
+__global__ void countBitMismatchesKernel(
+    const unsigned long long* __restrict__ before,
+    const unsigned long long* __restrict__ after,
+    std::uint64_t count,
+    unsigned long long* __restrict__ mismatches)
+{
+    const std::uint64_t index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < count && before[index] != after[index]) atomicAdd(mismatches, 1ULL);
+}
+
+__global__ void auditPressureOnlyKernel(
+    const double* __restrict__ oracle_pressure,
+    const double* __restrict__ p,
+    const double* __restrict__ p_before,
+    unsigned long long* __restrict__ mismatches,
+    int lx, int ly, int lz, int lztot)
+{
+    const std::uint64_t index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::uint64_t macro_count = static_cast<std::uint64_t>(lx) * ly * lztot;
+    if (index >= macro_count) return;
+
+    const int z_macro = static_cast<int>(index / (static_cast<std::uint64_t>(lx) * ly));
+    const int in_plane = static_cast<int>(index % (static_cast<std::uint64_t>(lx) * ly));
+    const unsigned long long actual = __double_as_longlong(p[index]);
+    unsigned long long expected = __double_as_longlong(p_before[index]);
+    if (z_macro >= 1 && z_macro <= lz) {
+        const int cell = ((z_macro - 1) * ly * lx) + in_plane;
+        expected = __double_as_longlong(oracle_pressure[cell]);
+    }
+    if (actual != expected) atomicAdd(mismatches, 1ULL);
+}
+
 __global__ void sourceStatsKernel(
     const double* __restrict__ u_x,
     const double* __restrict__ v_y,
@@ -727,6 +879,83 @@ __global__ void applyPressureGaugeKernel(
     const int macro_idx = ((z + 1) * ly + y) * lx + x;
     p[macro_idx] -= shift;
     for (int q = 0; q < 15; ++q) hh[cell * 15 + q] -= c_Ei[q] * shift;
+}
+
+__global__ void captureTailHneqKernel(
+    const double* __restrict__ p,
+    const double* __restrict__ hh,
+    const double* __restrict__ p_prev,
+    double* __restrict__ tail_p,
+    double* __restrict__ tail_hneq,
+    double* __restrict__ tail_p_prev,
+    int n, int lx, int ly, int lztot)
+{
+    const int cell = blockIdx.x * blockDim.x + threadIdx.x;
+    if (cell >= n) return;
+    const int x = cell % lx;
+    const int y = (cell / lx) % ly;
+    const int z = cell / (lx * ly);
+    const int macro = ((z + 1) * ly + y) * lx + x;
+    const double pressure = p[macro];
+    tail_p[cell] = pressure;
+    tail_p_prev[cell] = p_prev[cell];
+    for (int q = 0; q < 15; ++q) {
+        tail_hneq[cell * 15 + q] = hh[cell * 15 + q] - c_Ei[q] * pressure;
+    }
+    (void)lztot;
+}
+
+__global__ void restoreTailHneqKernel(
+    const double* __restrict__ tail_p,
+    const double* __restrict__ tail_hneq,
+    const double* __restrict__ tail_p_prev,
+    double* __restrict__ p,
+    double* __restrict__ hh,
+    double* __restrict__ p_prev,
+    int n, int lx, int ly, int lztot)
+{
+    const int cell = blockIdx.x * blockDim.x + threadIdx.x;
+    if (cell >= n) return;
+    const int x = cell % lx;
+    const int y = (cell / lx) % ly;
+    const int z = cell / (lx * ly);
+    const int macro = ((z + 1) * ly + y) * lx + x;
+    const double pressure = tail_p[cell];
+    p[macro] = pressure;
+    p_prev[cell] = tail_p_prev[cell];
+    for (int q = 0; q < 15; ++q) {
+        hh[cell * 15 + q] = c_Ei[q] * pressure + tail_hneq[cell * 15 + q];
+    }
+    (void)lztot;
+}
+
+__global__ void packPoissonEntryFeaturesKernel(
+    const double* __restrict__ p,
+    const double* __restrict__ rho,
+    const double* __restrict__ fei,
+    const double* __restrict__ u,
+    const double* __restrict__ v,
+    const double* __restrict__ w,
+    const double* __restrict__ u_x,
+    const double* __restrict__ v_y,
+    const double* __restrict__ w_z,
+    float* __restrict__ features,
+    int lx, int ly, int lz, int lztot)
+{
+    const int cell = blockIdx.x * blockDim.x + threadIdx.x;
+    const int n = lx * ly * lz;
+    if (cell >= n) return;
+    const int x = cell % lx;
+    const int y = (cell / lx) % ly;
+    const int z = cell / (lx * ly);
+    const int macro_idx = ((z + 1) * ly + y) * lx + x;
+    features[0 * n + cell] = static_cast<float>(p[macro_idx]);
+    features[1 * n + cell] = static_cast<float>(rho[macro_idx]);
+    features[2 * n + cell] = static_cast<float>(fei[macro_idx]);
+    features[3 * n + cell] = static_cast<float>(u[macro_idx]);
+    features[4 * n + cell] = static_cast<float>(v[macro_idx]);
+    features[5 * n + cell] = static_cast<float>(w[macro_idx]);
+    features[6 * n + cell] = static_cast<float>(u_x[cell] + v_y[cell] + w_z[cell]);
 }
 
 __global__ void boundaryAndComputePressureKernel(
@@ -1594,6 +1823,7 @@ void InamuroCUDA::allocateDeviceMemory()
     CUDA_CHECK(cudaMalloc(&gpu.d_pressure_block_sums, cell_bytes));
     CUDA_CHECK(cudaMalloc(&gpu.d_pressure_block_error, sizeof(double)));
     CUDA_CHECK(cudaMalloc(&gpu.d_fixed_point_block_sums, fixed_point_block_bytes));
+    CUDA_CHECK(cudaMalloc(&gpu.d_oracle_pressure, cell_bytes));
     CUDA_CHECK(cudaMalloc(&gpu.d_source_stats, 3 * sizeof(double)));
     CUDA_CHECK(cudaMemset(gpu.d_p_prev, 0, cell_bytes));
     CUDA_CHECK(cudaMemset(gpu.d_pressure_error, 0, 2 * sizeof(double)));
@@ -1603,6 +1833,7 @@ void InamuroCUDA::allocateDeviceMemory()
     CUDA_CHECK(cudaMemset(gpu.d_pressure_block_sums, 0, cell_bytes));
     CUDA_CHECK(cudaMemset(gpu.d_pressure_block_error, 0, sizeof(double)));
     CUDA_CHECK(cudaMemset(gpu.d_fixed_point_block_sums, 0, fixed_point_block_bytes));
+    CUDA_CHECK(cudaMemset(gpu.d_oracle_pressure, 0, cell_bytes));
     CUDA_CHECK(cudaMemset(gpu.d_source_stats, 0, 3 * sizeof(double)));
 }
 
@@ -1621,7 +1852,12 @@ void InamuroCUDA::freeDeviceMemory()
     S(gpu.d_p_prev); S(gpu.d_pressure_error);
     S(gpu.d_anderson_prev_residual); S(gpu.d_anderson_prev_image); S(gpu.d_anderson_stats);
     S(gpu.d_pressure_block_sums); S(gpu.d_pressure_block_error); S(gpu.d_fixed_point_block_sums);
-    S(gpu.d_source_stats);
+    S(gpu.d_oracle_pressure); S(gpu.d_source_stats);
+    S(gpu.d_tail_p); S(gpu.d_tail_hneq); S(gpu.d_tail_p_prev);
+    if (gpu.d_poisson_features) {
+        cudaFree(gpu.d_poisson_features);
+        gpu.d_poisson_features = nullptr;
+    }
 }
 
 // 将 CPU 三/四维容器扁平化并上传（需要 Inamuro 声明 friend）
@@ -1711,9 +1947,543 @@ void InamuroCUDA::synchronize() const
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
+void InamuroCUDA::setOracleRoute(OracleRoute route)
+{
+    oracle_route = route;
+    oracle_pressure_ready = false;
+}
+
+void InamuroCUDA::uploadOraclePressure(const std::vector<double>& pressure)
+{
+    if (oracle_route == OracleRoute::Baseline) {
+        throw std::runtime_error("baseline route must not receive oracle pressure");
+    }
+    if (pressure.size() != static_cast<std::size_t>(N_cells)) {
+        throw std::invalid_argument("oracle pressure size does not match physical grid");
+    }
+    for (double value : pressure) {
+        if (!std::isfinite(value)) {
+            throw std::runtime_error("oracle pressure contains NaN/Inf");
+        }
+    }
+    CUDA_CHECK(cudaMemcpy(gpu.d_oracle_pressure, pressure.data(),
+                          pressure.size() * sizeof(double), cudaMemcpyHostToDevice));
+    oracle_pressure_ready = true;
+}
+
+InamuroCUDA::POnlyInjectionAuditResult InamuroCUDA::auditPOnlyInjection()
+{
+    if (oracle_route != OracleRoute::POnlyHotStart || !oracle_pressure_ready) {
+        throw std::runtime_error("p-only injection audit requires a fresh p-only Oracle pressure");
+    }
+
+    const std::size_t dist_values = static_cast<std::size_t>(N_cells) * Q;
+    const std::size_t macro_values = static_cast<std::size_t>(N_macro);
+    const std::size_t cell_values = static_cast<std::size_t>(N_cells);
+    const std::size_t snapshot_values = std::max(dist_values, macro_values);
+    unsigned long long* snapshot = nullptr;
+    unsigned long long* mismatches = nullptr;
+    CUDA_CHECK(cudaMalloc(&snapshot, snapshot_values * sizeof(unsigned long long)));
+    CUDA_CHECK(cudaMalloc(&mismatches, sizeof(unsigned long long)));
+
+    POnlyInjectionAuditResult result;
+    dim3 block(8, 8, 8);
+    dim3 grid((lx + block.x - 1) / block.x,
+              (ly + block.y - 1) / block.y,
+              (lz + block.z - 1) / block.z);
+    constexpr int audit_threads = 256;
+
+    auto inject = [&]() {
+        injectOraclePressureOnlyKernel<<<grid, block>>>(
+            gpu.d_oracle_pressure, gpu.d_p, lx, ly, lz, lz_total);
+        CUDA_CHECK(cudaGetLastError());
+    };
+    auto audit_unchanged = [&](const double* values, std::size_t count) {
+        CUDA_CHECK(cudaMemcpy(snapshot, values, count * sizeof(double), cudaMemcpyDeviceToDevice));
+        inject();
+        CUDA_CHECK(cudaMemset(mismatches, 0, sizeof(unsigned long long)));
+        const int blocks = static_cast<int>((count + audit_threads - 1) / audit_threads);
+        countBitMismatchesKernel<<<blocks, audit_threads>>>(
+            snapshot, reinterpret_cast<const unsigned long long*>(values), count, mismatches);
+        CUDA_CHECK(cudaGetLastError());
+        unsigned long long host_mismatches = 0;
+        CUDA_CHECK(cudaMemcpy(&host_mismatches, mismatches,
+                              sizeof(host_mismatches), cudaMemcpyDeviceToHost));
+        result.unchanged_values_checked += count;
+        result.unchanged_value_mismatches += host_mismatches;
+    };
+
+    try {
+        CUDA_CHECK(cudaMemcpy(snapshot, gpu.d_p, macro_values * sizeof(double), cudaMemcpyDeviceToDevice));
+        inject();
+        CUDA_CHECK(cudaMemset(mismatches, 0, sizeof(unsigned long long)));
+        const int pressure_blocks = static_cast<int>((macro_values + audit_threads - 1) / audit_threads);
+        auditPressureOnlyKernel<<<pressure_blocks, audit_threads>>>(
+            gpu.d_oracle_pressure, gpu.d_p,
+            reinterpret_cast<const double*>(snapshot), mismatches,
+            lx, ly, lz, lz_total);
+        CUDA_CHECK(cudaGetLastError());
+        unsigned long long pressure_mismatches = 0;
+        CUDA_CHECK(cudaMemcpy(&pressure_mismatches, mismatches,
+                              sizeof(pressure_mismatches), cudaMemcpyDeviceToHost));
+        result.pressure_values_checked = macro_values;
+        result.pressure_value_mismatches = pressure_mismatches;
+
+        const std::vector<std::pair<const double*, std::size_t>> fields = {
+            {gpu.d_ff, dist_values}, {gpu.d_gg, dist_values}, {gpu.d_hh, dist_values},
+            {gpu.d_ff_tmp, dist_values}, {gpu.d_gg_tmp, dist_values}, {gpu.d_hh_tmp, dist_values},
+            {gpu.d_rho, macro_values}, {gpu.d_fei, macro_values}, {gpu.d_u, macro_values},
+            {gpu.d_v, macro_values}, {gpu.d_w, macro_values}, {gpu.d_p_tmp, macro_values},
+            {gpu.d_fei_x, cell_values}, {gpu.d_fei_y, cell_values}, {gpu.d_fei_z, cell_values},
+            {gpu.d_rho_x, cell_values}, {gpu.d_rho_y, cell_values}, {gpu.d_rho_z, cell_values},
+            {gpu.d_u_x, cell_values}, {gpu.d_u_y, cell_values}, {gpu.d_u_z, cell_values},
+            {gpu.d_v_x, cell_values}, {gpu.d_v_y, cell_values}, {gpu.d_v_z, cell_values},
+            {gpu.d_w_x, cell_values}, {gpu.d_w_y, cell_values}, {gpu.d_w_z, cell_values},
+            {gpu.d_fei_lap, cell_values}, {gpu.d_u_lap, cell_values},
+            {gpu.d_v_lap, cell_values}, {gpu.d_w_lap, cell_values},
+            {gpu.d_p_prev, cell_values}, {gpu.d_pressure_error, 2},
+            {gpu.d_anderson_prev_residual, dist_values}, {gpu.d_anderson_prev_image, dist_values},
+            {gpu.d_anderson_stats, 2}, {gpu.d_pressure_block_sums, cell_values},
+            {gpu.d_pressure_block_error, 1},
+            {gpu.d_fixed_point_block_sums,
+             static_cast<std::size_t>(((N_cells + 255) / 256) * 6)},
+            {gpu.d_source_stats, 3},
+        };
+        for (const auto& field : fields) audit_unchanged(field.first, field.second);
+        result.passed = result.unchanged_value_mismatches == 0 &&
+                        result.pressure_value_mismatches == 0;
+    } catch (...) {
+        cudaFree(snapshot);
+        cudaFree(mismatches);
+        throw;
+    }
+    CUDA_CHECK(cudaFree(snapshot));
+    CUDA_CHECK(cudaFree(mismatches));
+    return result;
+}
+
 const InamuroCUDA::PoissonStepDiagnostics& InamuroCUDA::getLastPoissonDiagnostics() const
 {
     return last_poisson_diagnostics;
+}
+
+void InamuroCUDA::ensureTailHneqBuffers()
+{
+    const std::size_t cells = static_cast<std::size_t>(N_cells);
+    if (!gpu.d_tail_p) {
+        CUDA_CHECK(cudaMalloc(&gpu.d_tail_p, cells * sizeof(double)));
+    }
+    if (!gpu.d_tail_hneq) {
+        CUDA_CHECK(cudaMalloc(&gpu.d_tail_hneq, cells * Q * sizeof(double)));
+    }
+    if (!gpu.d_tail_p_prev) {
+        CUDA_CHECK(cudaMalloc(&gpu.d_tail_p_prev, cells * sizeof(double)));
+    }
+}
+
+void InamuroCUDA::captureTailHneqSnapshot(std::uint64_t iteration)
+{
+    ensureTailHneqBuffers();
+    constexpr int threads = 256;
+    const int blocks = (N_cells + threads - 1) / threads;
+    captureTailHneqKernel<<<blocks, threads>>>(
+        gpu.d_p, gpu.d_hh, gpu.d_p_prev,
+        gpu.d_tail_p, gpu.d_tail_hneq, gpu.d_tail_p_prev,
+        N_cells, lx, ly, lz_total);
+    CUDA_CHECK(cudaGetLastError());
+    tail_hneq_snapshot_iteration = iteration;
+    tail_hneq_snapshot_valid = true;
+}
+
+void InamuroCUDA::publishTailHneqSnapshot(
+    std::uint32_t step,
+    std::uint64_t reference_iterations,
+    double gauge_target,
+    double source_mean,
+    double source_abs_mean,
+    double projected_source_mean)
+{
+    const auto started = std::chrono::steady_clock::now();
+    if (tail_hneq_capture_directory.empty() || !tail_hneq_snapshot_valid) {
+        throw std::runtime_error("tail+hneq capture snapshot is unavailable");
+    }
+    if (reference_iterations < 100 || reference_iterations % 100 != 0 ||
+        tail_hneq_snapshot_iteration != reference_iterations - 100) {
+        throw std::runtime_error("tail+hneq snapshot is not the K-100 checkpoint");
+    }
+    if ((tail_hneq_snapshot_iteration & 1ULL) != 0) {
+        throw std::runtime_error("tail+hneq snapshot active phase is not the split baseline phase");
+    }
+
+    const std::size_t cells = static_cast<std::size_t>(N_cells);
+    std::vector<double> pressure(cells);
+    std::vector<double> hneq(cells * Q);
+    std::vector<double> pressure_cache(cells);
+    CUDA_CHECK(cudaMemcpy(pressure.data(), gpu.d_tail_p,
+                          pressure.size() * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(hneq.data(), gpu.d_tail_hneq,
+                          hneq.size() * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(pressure_cache.data(), gpu.d_tail_p_prev,
+                          pressure_cache.size() * sizeof(double), cudaMemcpyDeviceToHost));
+    auto require_finite = [](const std::vector<double>& values, const char* label) {
+        for (double value : values) {
+            if (!std::isfinite(value)) {
+                throw std::runtime_error(std::string("nonfinite tail+hneq ") + label);
+            }
+        }
+    };
+    require_finite(pressure, "pressure payload");
+    require_finite(hneq, "hneq payload");
+    require_finite(pressure_cache, "pressure-cache payload");
+    if (tail_hneq_snapshot_iteration > 0 &&
+        std::memcmp(pressure.data(), pressure_cache.data(),
+                    pressure.size() * sizeof(double)) != 0) {
+        throw std::runtime_error(
+            "tail+hneq post-check pressure cache is not bitwise synchronized");
+    }
+
+    const std::uint64_t payload_bytes = static_cast<std::uint64_t>(
+        (pressure.size() + hneq.size() + pressure_cache.size()) * sizeof(double));
+    std::uint64_t payload_hash = fnv1a64(
+        pressure.data(), pressure.size() * sizeof(double));
+    payload_hash = fnv1a64(hneq.data(), hneq.size() * sizeof(double), payload_hash);
+    payload_hash = fnv1a64(pressure_cache.data(),
+                           pressure_cache.size() * sizeof(double), payload_hash);
+
+    TailHneqFileHeader header{};
+    std::memcpy(header.magic, kTailHneqMagic, sizeof(header.magic));
+    header.version = kTailHneqVersion;
+    header.header_bytes = sizeof(header);
+    header.lx = static_cast<std::uint32_t>(lx);
+    header.ly = static_cast<std::uint32_t>(ly);
+    header.lz = static_cast<std::uint32_t>(lz);
+    header.directions = Q;
+    header.step = step;
+    header.check_interval = 100;
+    header.active_phase = 0;
+    header.endian_tag = kTailEndianTag;
+    header.float_bytes = sizeof(double);
+    header.layout_id = kTailLayoutId;
+    header.reference_iterations = reference_iterations;
+    header.tail_iteration = tail_hneq_snapshot_iteration;
+    header.cells = cells;
+    header.pressure_values = pressure.size();
+    header.hneq_values = hneq.size();
+    header.pressure_cache_values = pressure_cache.size();
+    header.payload_bytes = payload_bytes;
+    header.payload_fnv1a64 = payload_hash;
+    header.tolerance = 1.0e-3;
+    header.gauge_target = gauge_target;
+    header.source_mean = source_mean;
+    header.source_abs_mean = source_abs_mean;
+    header.projected_source_mean = projected_source_mean;
+
+    const auto final_path = tailHneqPath(tail_hneq_capture_directory, step);
+    const auto temp_path = final_path.string() + ".tmp";
+    if (std::filesystem::exists(final_path)) {
+        throw std::runtime_error("refusing to overwrite tail+hneq artifact: " +
+                                 final_path.string());
+    }
+    std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        throw std::runtime_error("cannot open tail+hneq artifact: " + temp_path);
+    }
+    out.write(reinterpret_cast<const char*>(&header), sizeof(header));
+    out.write(reinterpret_cast<const char*>(pressure.data()),
+              static_cast<std::streamsize>(pressure.size() * sizeof(double)));
+    out.write(reinterpret_cast<const char*>(hneq.data()),
+              static_cast<std::streamsize>(hneq.size() * sizeof(double)));
+    out.write(reinterpret_cast<const char*>(pressure_cache.data()),
+              static_cast<std::streamsize>(pressure_cache.size() * sizeof(double)));
+    out.close();
+    if (!out) {
+        std::filesystem::remove(temp_path);
+        throw std::runtime_error("failed writing tail+hneq artifact: " + temp_path);
+    }
+    std::filesystem::rename(temp_path, final_path);
+    const auto ended = std::chrono::steady_clock::now();
+    last_poisson_diagnostics.warm_start_io_ms +=
+        std::chrono::duration<double, std::milli>(ended - started).count();
+    last_poisson_diagnostics.reference_iterations = reference_iterations;
+    last_poisson_diagnostics.tail_iteration = tail_hneq_snapshot_iteration;
+}
+
+void InamuroCUDA::restoreTailHneqSnapshot(
+    std::uint32_t step,
+    double gauge_target,
+    double source_mean,
+    double source_abs_mean,
+    double projected_source_mean)
+{
+    const auto started = std::chrono::steady_clock::now();
+    const auto path = tailHneqPath(tail_hneq_replay_directory, step);
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        throw std::runtime_error("cannot open tail+hneq artifact: " + path.string());
+    }
+    TailHneqFileHeader header{};
+    in.read(reinterpret_cast<char*>(&header), sizeof(header));
+    if (!in || std::memcmp(header.magic, kTailHneqMagic, sizeof(header.magic)) != 0 ||
+        header.version != kTailHneqVersion || header.header_bytes != sizeof(header)) {
+        throw std::runtime_error("invalid tail+hneq artifact header: " + path.string());
+    }
+    const std::uint64_t cells = static_cast<std::uint64_t>(N_cells);
+    const std::uint64_t h_values = cells * Q;
+    const std::uint64_t expected_payload_bytes =
+        (cells + h_values + cells) * sizeof(double);
+    if (header.lx != static_cast<std::uint32_t>(lx) ||
+        header.ly != static_cast<std::uint32_t>(ly) ||
+        header.lz != static_cast<std::uint32_t>(lz) ||
+        header.directions != Q || header.step != step ||
+        header.check_interval != 100 || header.tolerance != 1.0e-3 ||
+        header.endian_tag != kTailEndianTag ||
+        header.float_bytes != sizeof(double) ||
+        header.layout_id != kTailLayoutId ||
+        header.cells != cells || header.pressure_values != cells ||
+        header.hneq_values != h_values || header.pressure_cache_values != cells ||
+        header.payload_bytes != expected_payload_bytes ||
+        header.reference_iterations < 100 ||
+        header.reference_iterations % 100 != 0 ||
+        header.tail_iteration != header.reference_iterations - 100 ||
+        header.active_phase != 0 || (header.tail_iteration & 1ULL) != 0) {
+        throw std::runtime_error("tail+hneq artifact contract mismatch: " + path.string());
+    }
+    const std::uint64_t expected_file_bytes = sizeof(header) + expected_payload_bytes;
+    if (std::filesystem::file_size(path) != expected_file_bytes) {
+        throw std::runtime_error("tail+hneq artifact length mismatch: " + path.string());
+    }
+    if (!metadataCompatible(gauge_target, header.gauge_target) ||
+        !metadataCompatible(source_mean, header.source_mean) ||
+        !metadataCompatible(source_abs_mean, header.source_abs_mean) ||
+        !metadataCompatible(projected_source_mean, header.projected_source_mean)) {
+        throw std::runtime_error("tail+hneq gauge/source metadata mismatch: " + path.string());
+    }
+
+    std::vector<double> pressure(static_cast<std::size_t>(cells));
+    std::vector<double> hneq(static_cast<std::size_t>(h_values));
+    std::vector<double> pressure_cache(static_cast<std::size_t>(cells));
+    in.read(reinterpret_cast<char*>(pressure.data()),
+            static_cast<std::streamsize>(pressure.size() * sizeof(double)));
+    in.read(reinterpret_cast<char*>(hneq.data()),
+            static_cast<std::streamsize>(hneq.size() * sizeof(double)));
+    in.read(reinterpret_cast<char*>(pressure_cache.data()),
+            static_cast<std::streamsize>(pressure_cache.size() * sizeof(double)));
+    if (!in) {
+        throw std::runtime_error("truncated tail+hneq payload: " + path.string());
+    }
+    std::uint64_t payload_hash = fnv1a64(
+        pressure.data(), pressure.size() * sizeof(double));
+    payload_hash = fnv1a64(hneq.data(), hneq.size() * sizeof(double), payload_hash);
+    payload_hash = fnv1a64(pressure_cache.data(),
+                           pressure_cache.size() * sizeof(double), payload_hash);
+    if (payload_hash != header.payload_fnv1a64) {
+        throw std::runtime_error("tail+hneq payload checksum mismatch: " + path.string());
+    }
+    for (double value : pressure) {
+        if (!std::isfinite(value)) throw std::runtime_error("nonfinite tail pressure payload");
+    }
+    for (double value : hneq) {
+        if (!std::isfinite(value)) throw std::runtime_error("nonfinite tail hneq payload");
+    }
+    for (double value : pressure_cache) {
+        if (!std::isfinite(value)) throw std::runtime_error("nonfinite tail pressure-cache payload");
+    }
+    if (header.tail_iteration > 0 &&
+        std::memcmp(pressure.data(), pressure_cache.data(),
+                    pressure.size() * sizeof(double)) != 0) {
+        throw std::runtime_error(
+            "tail+hneq post-check pressure cache payload is not bitwise synchronized");
+    }
+
+    // The serialized pressure itself must carry the recorded gauge.
+    double pressure_sum = 0.0;
+    double compensation = 0.0;
+    for (double value : pressure) {
+        const double y = value - compensation;
+        const double t = pressure_sum + y;
+        compensation = (t - pressure_sum) - y;
+        pressure_sum = t;
+    }
+    if (!metadataCompatible(pressure_sum / static_cast<double>(cells),
+                            header.gauge_target)) {
+        throw std::runtime_error("tail+hneq pressure gauge payload mismatch");
+    }
+
+    ensureTailHneqBuffers();
+    CUDA_CHECK(cudaMemcpy(gpu.d_tail_p, pressure.data(),
+                          pressure.size() * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(gpu.d_tail_hneq, hneq.data(),
+                          hneq.size() * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(gpu.d_tail_p_prev, pressure_cache.data(),
+                          pressure_cache.size() * sizeof(double), cudaMemcpyHostToDevice));
+    constexpr int threads = 256;
+    const int blocks = (N_cells + threads - 1) / threads;
+    restoreTailHneqKernel<<<blocks, threads>>>(
+        gpu.d_tail_p, gpu.d_tail_hneq, gpu.d_tail_p_prev,
+        gpu.d_p, gpu.d_hh, gpu.d_p_prev,
+        N_cells, lx, ly, lz_total);
+    CUDA_CHECK(cudaGetLastError());
+
+    std::vector<double> restored_pressure(pressure.size());
+    std::vector<double> restored_h(hneq.size());
+    std::vector<double> restored_cache(pressure_cache.size());
+    CUDA_CHECK(cudaMemcpy(restored_pressure.data(),
+                          gpu.d_p + static_cast<std::size_t>(lx) * ly,
+                          restored_pressure.size() * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(restored_h.data(), gpu.d_hh,
+                          restored_h.size() * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(restored_cache.data(), gpu.d_p_prev,
+                          restored_cache.size() * sizeof(double), cudaMemcpyDeviceToHost));
+    double max_abs = 0.0;
+    for (std::size_t cell = 0; cell < pressure.size(); ++cell) {
+        max_abs = std::max(max_abs, std::abs(restored_pressure[cell] - pressure[cell]));
+        max_abs = std::max(max_abs, std::abs(restored_cache[cell] - pressure_cache[cell]));
+        for (int q = 0; q < Q; ++q) {
+            const std::size_t index = cell * Q + q;
+            const double expected = std::fma(kTailEi[q], pressure[cell], hneq[index]);
+            max_abs = std::max(max_abs, std::abs(restored_h[index] - expected));
+        }
+        double pressure_from_h = 0.0;
+        for (int q = 0; q < Q; ++q) {
+            pressure_from_h += restored_h[cell * Q + q];
+        }
+        const double moment_error = std::abs(pressure_from_h - restored_pressure[cell]);
+        max_abs = std::max(max_abs, moment_error);
+        if (!(moment_error <= 1.0e-12)) {
+            throw std::runtime_error(
+                "tail+hneq reconstructed pressure moment exceeds 1e-12");
+        }
+    }
+    if (!std::isfinite(max_abs)) {
+        throw std::runtime_error("tail+hneq restore audit contains NaN/Inf");
+    }
+    const auto ended = std::chrono::steady_clock::now();
+    last_poisson_diagnostics.warm_start_used = true;
+    last_poisson_diagnostics.reference_iterations = header.reference_iterations;
+    last_poisson_diagnostics.tail_iteration = header.tail_iteration;
+    last_poisson_diagnostics.warm_start_restore_max_abs = max_abs;
+    last_poisson_diagnostics.warm_start_io_ms +=
+        std::chrono::duration<double, std::milli>(ended - started).count();
+}
+
+void InamuroCUDA::dumpPoissonEntryFeatures(std::uint32_t step)
+{
+    if (poisson_feature_dump_directory.empty()) return;
+    if (!gpu.d_poisson_features) {
+        throw std::runtime_error("Poisson feature buffer is not allocated");
+    }
+    constexpr std::uint32_t channels = 7;
+    constexpr int threads = 256;
+    const int blocks = (N_cells + threads - 1) / threads;
+    packPoissonEntryFeaturesKernel<<<blocks, threads>>>(
+        gpu.d_p, gpu.d_rho, gpu.d_fei, gpu.d_u, gpu.d_v, gpu.d_w,
+        gpu.d_u_x, gpu.d_v_y, gpu.d_w_z, gpu.d_poisson_features,
+        lx, ly, lz, lz_total);
+    CUDA_CHECK(cudaGetLastError());
+
+    std::vector<float> host(static_cast<std::size_t>(channels) * N_cells);
+    CUDA_CHECK(cudaMemcpy(host.data(), gpu.d_poisson_features,
+                          host.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    for (float value : host) {
+        if (!std::isfinite(value)) {
+            throw std::runtime_error("Poisson entry feature contains NaN/Inf");
+        }
+    }
+
+    std::ostringstream name;
+    name << poisson_feature_dump_directory << "/features_"
+         << std::setw(4) << std::setfill('0') << step << ".bin";
+    std::ofstream out(name.str(), std::ios::binary | std::ios::trunc);
+    if (!out) throw std::runtime_error("cannot open Poisson feature dump: " + name.str());
+    const char magic[8] = {'C', 'L', 'B', 'M', 'F', '0', '1', '\0'};
+    const std::uint32_t header[5] = {
+        static_cast<std::uint32_t>(lx), static_cast<std::uint32_t>(ly),
+        static_cast<std::uint32_t>(lz), step, channels};
+    out.write(magic, sizeof(magic));
+    out.write(reinterpret_cast<const char*>(header), sizeof(header));
+    out.write(reinterpret_cast<const char*>(host.data()),
+              static_cast<std::streamsize>(host.size() * sizeof(float)));
+    if (!out) throw std::runtime_error("failed writing Poisson feature dump: " + name.str());
+}
+
+void InamuroCUDA::dumpFixedPointState(
+    std::uint32_t step, std::uint64_t iteration)
+{
+    if (poisson_fixed_point_dump_directory.empty()) return;
+    const std::size_t cells = static_cast<std::size_t>(N_cells);
+    const std::size_t plane = static_cast<std::size_t>(lx) * ly;
+    std::vector<double> p(cells), rho(cells), u_x(cells), v_y(cells), w_z(cells);
+    std::vector<double> h(cells * Q);
+    CUDA_CHECK(cudaMemcpy(p.data(), gpu.d_p + plane,
+                          cells * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(rho.data(), gpu.d_rho + plane,
+                          cells * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(u_x.data(), gpu.d_u_x,
+                          cells * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(v_y.data(), gpu.d_v_y,
+                          cells * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(w_z.data(), gpu.d_w_z,
+                          cells * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h.data(), gpu.d_hh,
+                          h.size() * sizeof(double), cudaMemcpyDeviceToHost));
+    auto require_finite = [](const std::vector<double>& values, const char* name) {
+        for (double value : values) {
+            if (!std::isfinite(value)) {
+                throw std::runtime_error(std::string("fixed-point state ") +
+                                         name + " contains NaN/Inf");
+            }
+        }
+    };
+    require_finite(p, "p"); require_finite(rho, "rho");
+    require_finite(u_x, "u_x"); require_finite(v_y, "v_y");
+    require_finite(w_z, "w_z"); require_finite(h, "h");
+
+    std::ostringstream stem;
+    stem << "fixed_state_step" << std::setw(4) << std::setfill('0') << step
+         << "_iter" << std::setw(8) << std::setfill('0') << iteration << ".bin";
+    const std::filesystem::path final_path =
+        std::filesystem::path(poisson_fixed_point_dump_directory) / stem.str();
+    const std::filesystem::path temporary_path = final_path.string() + ".tmp";
+    std::ofstream out(temporary_path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        throw std::runtime_error("cannot open fixed-point state dump: " +
+                                 temporary_path.string());
+    }
+    const char magic[8] = {'C', 'L', 'B', 'M', 'K', '0', '1', '\0'};
+    const std::uint32_t header32[10] = {
+        0x01020304u, 8u, static_cast<std::uint32_t>(lx),
+        static_cast<std::uint32_t>(ly), static_cast<std::uint32_t>(lz),
+        static_cast<std::uint32_t>(lz_total), static_cast<std::uint32_t>(Q),
+        step, 6u, 1u};
+    const std::uint64_t payload_values = checkedMultiply(
+        static_cast<std::uint64_t>(cells), 20, "fixed-point payload");
+    const std::uint64_t header64[3] = {
+        iteration, static_cast<std::uint64_t>(cells), payload_values};
+    const double header_f64[2] = {
+        last_poisson_diagnostics.pressure_gauge_target, pressure_relax_scale};
+    out.write(magic, sizeof(magic));
+    out.write(reinterpret_cast<const char*>(header32), sizeof(header32));
+    out.write(reinterpret_cast<const char*>(header64), sizeof(header64));
+    out.write(reinterpret_cast<const char*>(header_f64), sizeof(header_f64));
+    auto write_values = [&](const std::vector<double>& values) {
+        out.write(reinterpret_cast<const char*>(values.data()),
+                  static_cast<std::streamsize>(values.size() * sizeof(double)));
+    };
+    write_values(p); write_values(rho); write_values(u_x);
+    write_values(v_y); write_values(w_z); write_values(h);
+    out.close();
+    if (!out) {
+        throw std::runtime_error("failed writing fixed-point state dump: " +
+                                 temporary_path.string());
+    }
+    std::error_code ec;
+    std::filesystem::remove(final_path, ec);
+    ec.clear();
+    std::filesystem::rename(temporary_path, final_path, ec);
+    if (ec) {
+        throw std::runtime_error("failed publishing fixed-point state dump: " +
+                                 ec.message());
+    }
 }
 
 // ==================== 单步流程（基线） ====================
@@ -1845,6 +2615,17 @@ void InamuroCUDA::doPressurePoisson()
 
     const bool fixed_point_enabled =
         enable_poisson_fixed_point_shadow || use_poisson_dual_residual;
+    const bool tail_hneq_capture = !tail_hneq_capture_directory.empty();
+    const bool tail_hneq_replay = !tail_hneq_replay_directory.empty();
+    if (tail_hneq_capture && tail_hneq_replay) {
+        throw std::runtime_error("tail+hneq capture and replay are mutually exclusive");
+    }
+    if ((enable_poisson_shadow_state_audit ||
+         !poisson_fixed_point_dump_directory.empty()) &&
+        (!use_poisson_dual_residual || oracle_route != OracleRoute::Baseline)) {
+        throw std::runtime_error(
+            "fixed-point state evidence requires the strict baseline dual-residual route");
+    }
     if (fixed_point_enabled &&
         (use_scalar_poisson || use_onepass_poisson || use_fused_poisson ||
          use_fused_boundary_pressure || use_source_aware_hh_init ||
@@ -1857,12 +2638,37 @@ void InamuroCUDA::doPressurePoisson()
     }
     if (use_poisson_dual_residual &&
         (check_interval != 100 || tolerance != 1.0e-3 ||
-         poisson_iteration_limit != 0 ||
+         poisson_iteration_limit != 0 || oracle_route != OracleRoute::Baseline ||
          !use_poisson_deterministic_reductions || use_poisson_spatial_diagnostics)) {
         throw std::runtime_error(
             "dual-residual exit requires check_interval=100, tolerance=1e-3, "
             "poisson_iteration_limit=0, deterministic reductions, no spatial "
-            "diagnostics");
+            "diagnostics, and the baseline route");
+    }
+    if ((tail_hneq_capture || tail_hneq_replay) &&
+        (!use_poisson_dual_residual || check_interval != 100 ||
+         tolerance != 1.0e-3 || poisson_iteration_limit != 0 ||
+         oracle_route != OracleRoute::Baseline ||
+         !use_poisson_deterministic_reductions ||
+         use_scalar_poisson || use_onepass_poisson || use_fused_poisson ||
+         use_fused_boundary_pressure || use_source_aware_hh_init ||
+         use_poisson_graph || use_poisson_anderson_m1 ||
+         use_poisson_two_grid_correction || use_poisson_spatial_diagnostics ||
+         pressure_relax_scale != 1.0 || poisson_fixed_point_relax != 1.0)) {
+        throw std::runtime_error(
+            "tail+hneq Oracle requires the unbounded strict split+split "
+            "dual-residual baseline (check=100, tolerance=1e-3)");
+    }
+
+    if (oracle_route != OracleRoute::Baseline && !oracle_pressure_ready) {
+        throw std::runtime_error("oracle route requires a fresh same-step exact pressure");
+    }
+    if (oracle_route == OracleRoute::POnlyHotStart) {
+        // Oracle contract: at Poisson entry write physical d_p only.  The kernel
+        // has no pointer through which d_hh, d_p_prev, or any other state can change.
+        injectOraclePressureOnlyKernel<<<grid, block>>>(
+            gpu.d_oracle_pressure, gpu.d_p, lx, ly, lz, lz_total);
+        CUDA_CHECK(cudaGetLastError());
     }
 
     constexpr int source_threads = 256;
@@ -1942,6 +2748,45 @@ void InamuroCUDA::doPressurePoisson()
     const double pressure_gauge_target = pressure_mean();
     last_poisson_diagnostics.pressure_gauge_target = pressure_gauge_target;
 
+    dumpPoissonEntryFeatures(static_cast<std::uint32_t>(perf.time_step_count + 1));
+
+    const auto poisson_step = static_cast<std::uint32_t>(perf.time_step_count + 1);
+    if (tail_hneq_capture) {
+        tail_hneq_snapshot_valid = false;
+        captureTailHneqSnapshot(0);
+    } else if (tail_hneq_replay) {
+        restoreTailHneqSnapshot(
+            poisson_step,
+            pressure_gauge_target,
+            last_poisson_diagnostics.source_mean,
+            last_poisson_diagnostics.source_abs_mean,
+            last_poisson_diagnostics.projected_source_mean);
+    }
+
+    if (oracle_route == OracleRoute::ExactPressure) {
+        injectOraclePressureOnlyKernel<<<grid, block>>>(
+            gpu.d_oracle_pressure, gpu.d_p, lx, ly, lz, lz_total);
+        CUDA_CHECK(cudaGetLastError());
+        last_poisson_diagnostics.iterations = 0;
+        last_poisson_diagnostics.relative_error = 0.0;
+        last_poisson_diagnostics.pressure_converged = true;
+        last_poisson_diagnostics.converged = true;
+        writePoissonDiagnostic(perf.time_step_count + 1, 0, 0.0, 0.0, 0.0,
+                               true, false, true,
+                               std::numeric_limits<double>::quiet_NaN(), 0, 0);
+        oracle_pressure_ready = false;
+        return;
+    }
+    if (oracle_route == OracleRoute::FirstCheckPressurePrev) {
+        CUDA_CHECK(cudaMemcpy(gpu.d_p_prev, gpu.d_oracle_pressure,
+                              static_cast<std::size_t>(N_cells) * sizeof(double),
+                              cudaMemcpyDeviceToDevice));
+    } else if (oracle_route == OracleRoute::ExactPressureToHH) {
+        injectOraclePressureAndHHKernel<<<grid, block>>>(
+            gpu.d_oracle_pressure, gpu.d_p, gpu.d_hh,
+            lx, ly, lz, lz_total);
+        CUDA_CHECK(cudaGetLastError());
+    }
     cudaEvent_t phase_start{}, phase_stop{};
     const bool detail_timing = enable_timing && enable_poisson_detail_timing;
     const bool graph_eligible =
@@ -1989,10 +2834,21 @@ void InamuroCUDA::doPressurePoisson()
             // active and read-only; d_hh_tmp is inactive at every check point.
             const std::size_t dist_bytes =
                 static_cast<std::size_t>(N_cells) * 15 * sizeof(double);
-            if (gpu.d_hh == gpu.d_hh_tmp ||
-                gpu.d_hh == gpu.d_anderson_prev_image ||
-                gpu.d_p == gpu.d_p_tmp) {
-                throw std::runtime_error("fixed-point shadow buffer alias detected");
+            const std::size_t physical_p_bytes =
+                static_cast<std::size_t>(N_cells) * sizeof(double);
+            if (enable_poisson_shadow_state_audit) {
+                if (gpu.d_hh == gpu.d_hh_tmp ||
+                    gpu.d_hh == gpu.d_anderson_prev_image ||
+                    gpu.d_hh == gpu.d_anderson_prev_residual ||
+                    gpu.d_p == gpu.d_p_tmp) {
+                    throw std::runtime_error("fixed-point shadow buffer alias detected");
+                }
+                CUDA_CHECK(cudaMemcpy(gpu.d_anderson_prev_residual, gpu.d_hh,
+                                      dist_bytes, cudaMemcpyDeviceToDevice));
+                CUDA_CHECK(cudaMemcpy(
+                    gpu.d_oracle_pressure,
+                    gpu.d_p + static_cast<std::size_t>(lx) * ly,
+                    physical_p_bytes, cudaMemcpyDeviceToDevice));
             }
             CUDA_CHECK(cudaMemcpy(gpu.d_hh_tmp, gpu.d_hh, dist_bytes,
                                   cudaMemcpyDeviceToDevice));
@@ -2054,6 +2910,52 @@ void InamuroCUDA::doPressurePoisson()
                 last_poisson_diagnostics.fixed_point_relative < tolerance;
             last_poisson_diagnostics.fixed_point_evaluated = true;
 
+            if (enable_poisson_shadow_state_audit) {
+                auto* mismatches = reinterpret_cast<unsigned long long*>(
+                    gpu.d_anderson_stats);
+                CUDA_CHECK(cudaMemset(mismatches, 0,
+                                      2 * sizeof(unsigned long long)));
+                constexpr int audit_threads = 256;
+                const std::uint64_t h_values =
+                    static_cast<std::uint64_t>(N_cells) * Q;
+                const int h_blocks = static_cast<int>(
+                    (h_values + audit_threads - 1) / audit_threads);
+                const int p_blocks =
+                    (N_cells + audit_threads - 1) / audit_threads;
+                countBitMismatchesKernel<<<h_blocks, audit_threads>>>(
+                    reinterpret_cast<const unsigned long long*>(
+                        gpu.d_anderson_prev_residual),
+                    reinterpret_cast<const unsigned long long*>(gpu.d_hh),
+                    h_values, &mismatches[0]);
+                countBitMismatchesKernel<<<p_blocks, audit_threads>>>(
+                    reinterpret_cast<const unsigned long long*>(
+                        gpu.d_oracle_pressure),
+                    reinterpret_cast<const unsigned long long*>(
+                        gpu.d_p + static_cast<std::size_t>(lx) * ly),
+                    static_cast<std::uint64_t>(N_cells), &mismatches[1]);
+                CUDA_CHECK(cudaGetLastError());
+                unsigned long long host_mismatches[2] = {0, 0};
+                CUDA_CHECK(cudaMemcpy(host_mismatches, mismatches,
+                                      sizeof(host_mismatches),
+                                      cudaMemcpyDeviceToHost));
+                checkedAccumulate(
+                    last_poisson_diagnostics.shadow_active_h_values_checked,
+                    h_values, "shadow active h audit count");
+                checkedAccumulate(
+                    last_poisson_diagnostics.shadow_active_h_mismatches,
+                    host_mismatches[0], "shadow active h mismatches");
+                checkedAccumulate(
+                    last_poisson_diagnostics.shadow_active_p_values_checked,
+                    static_cast<std::uint64_t>(N_cells),
+                    "shadow active p audit count");
+                checkedAccumulate(
+                    last_poisson_diagnostics.shadow_active_p_mismatches,
+                    host_mismatches[1], "shadow active p mismatches");
+                if (host_mismatches[0] != 0 || host_mismatches[1] != 0) {
+                    throw std::runtime_error(
+                        "fixed-point shadow modified active h/p state");
+                }
+            }
         }
 
         const int threads = 256;
@@ -2127,12 +3029,36 @@ void InamuroCUDA::doPressurePoisson()
         const bool converged = pressure_converged &&
             (!use_poisson_dual_residual ||
              last_poisson_diagnostics.fixed_point_converged);
+        if (tail_hneq_replay && iteration == 100) {
+            last_poisson_diagnostics.warm_start_first_check_converged = converged;
+            if (!converged) {
+                // A warm-start miss falls back to the unchanged unbounded
+                // strict solver; it does not terminate at the first check.
+                last_poisson_diagnostics.fallback_count = 1;
+            }
+        }
         last_poisson_diagnostics.iterations = iteration;
         last_poisson_diagnostics.relative_error = rel_error;
         last_poisson_diagnostics.pressure_l1_delta = h_err[0];
         last_poisson_diagnostics.pressure_l1_norm = h_err[1];
         last_poisson_diagnostics.pressure_converged = pressure_converged;
         last_poisson_diagnostics.converged = converged;
+        if (tail_hneq_capture) {
+            if (converged) {
+                publishTailHneqSnapshot(
+                    poisson_step,
+                    iteration,
+                    pressure_gauge_target,
+                    last_poisson_diagnostics.source_mean,
+                    last_poisson_diagnostics.source_abs_mean,
+                    last_poisson_diagnostics.projected_source_mean);
+            } else {
+                // pressureError* has already advanced d_p_prev to this
+                // post-gauge checkpoint.  Roll only after a failed check so
+                // a successful K publishes the preserved J=K-100 state.
+                captureTailHneqSnapshot(iteration);
+            }
+        }
         writePoissonDiagnostic(
             perf.time_step_count + 1,
             iteration,
@@ -2154,6 +3080,10 @@ void InamuroCUDA::doPressurePoisson()
                 poisson_two_grid_strength
             );
             CUDA_CHECK(cudaGetLastError());
+        }
+        if (converged) {
+            dumpFixedPointState(
+                static_cast<std::uint32_t>(perf.time_step_count + 1), iteration);
         }
         return converged;
     };
@@ -2193,6 +3123,7 @@ void InamuroCUDA::doPressurePoisson()
         checkedAccumulate(
             perf.total_poisson_iterations, last_poisson_diagnostics.iterations,
             "total Poisson iteration counter");
+        oracle_pressure_ready = false;
         return;
     }
 
@@ -2201,7 +3132,7 @@ void InamuroCUDA::doPressurePoisson()
     const int anderson_threads = 256;
     const int anderson_blocks = (anderson_values + anderson_threads - 1) / anderson_threads;
 
-    // 严格基线：无上限 while；每100次检查压力相对变化，dual模式同时检查固定点残差。
+    // 严格基线：无上限 while；只在固定区间检查 Eq.(6.44) 压力相对变化。
     std::uint64_t iter = 0;
     while (true) {
         iter = checkedIncrement(iter, "Poisson iteration counter");
@@ -2330,7 +3261,8 @@ void InamuroCUDA::doPressurePoisson()
         }
 
         if (iter % check_interval == 0) {
-            if (check_residual(iter)) {
+            const bool converged = check_residual(iter);
+            if (converged) {
                 break;
             }
             if (poisson_iteration_limit != 0 && iter >= poisson_iteration_limit) {
@@ -2342,6 +3274,7 @@ void InamuroCUDA::doPressurePoisson()
     checkedAccumulate(
         perf.total_poisson_iterations, last_poisson_diagnostics.iterations,
         "total Poisson iteration counter");
+    oracle_pressure_ready = false;
     if (detail_timing) {
         CUDA_CHECK(cudaEventDestroy(phase_start));
         CUDA_CHECK(cudaEventDestroy(phase_stop));
@@ -2565,6 +3498,11 @@ void InamuroCUDA::setUsePoissonDeterministicReductions(bool enabled)
     use_poisson_deterministic_reductions = enabled;
 }
 
+void InamuroCUDA::setEnablePoissonShadowStateAudit(bool enabled)
+{
+    enable_poisson_shadow_state_audit = enabled;
+}
+
 void InamuroCUDA::setEnablePoissonFixedPointShadow(bool enabled)
 {
     enable_poisson_fixed_point_shadow = enabled;
@@ -2622,8 +3560,51 @@ void InamuroCUDA::setPoissonDiagnosticsPath(const std::string& path)
         << "fixed_point_h_l1,fixed_point_h_scale,fixed_point_h_relative,"
         << "fixed_point_p_l1,fixed_point_p_scale,fixed_point_p_relative,"
         << "fixed_point_relative,fixed_point_evaluated,pressure_converged,fixed_point_converged,"
-        << "dual_residual_enabled,converged,block_low_frequency_fraction,"
-        << "block_size,block_count\n";
+        << "dual_residual_enabled,converged,shadow_active_h_values_checked,"
+        << "shadow_active_h_mismatches,shadow_active_p_values_checked,"
+        << "shadow_active_p_mismatches,block_low_frequency_fraction,"
+        << "block_size,block_count,warm_start_used,"
+        << "warm_start_first_check_converged,reference_iterations,tail_iteration,"
+        << "warm_start_io_ms,warm_start_restore_max_abs,fallback_count\n";
+}
+
+void InamuroCUDA::setPoissonFeatureDumpDirectory(const std::string& path)
+{
+    poisson_feature_dump_directory = path;
+    if (!path.empty() && !gpu.d_poisson_features) {
+        constexpr std::size_t channels = 7;
+        CUDA_CHECK(cudaMalloc(&gpu.d_poisson_features,
+                              channels * static_cast<std::size_t>(N_cells) * sizeof(float)));
+    }
+}
+
+void InamuroCUDA::setPoissonFixedPointDumpDirectory(const std::string& path)
+{
+    poisson_fixed_point_dump_directory = path;
+    if (!path.empty()) std::filesystem::create_directories(path);
+}
+
+void InamuroCUDA::setTailHneqCaptureDirectory(const std::string& path)
+{
+    if (!path.empty() && !tail_hneq_replay_directory.empty()) {
+        throw std::invalid_argument("tail+hneq capture and replay are mutually exclusive");
+    }
+    tail_hneq_capture_directory = path;
+    tail_hneq_snapshot_valid = false;
+    tail_hneq_snapshot_iteration = 0;
+    if (!path.empty()) {
+        std::filesystem::create_directories(path);
+        ensureTailHneqBuffers();
+    }
+}
+
+void InamuroCUDA::setTailHneqReplayDirectory(const std::string& path)
+{
+    if (!path.empty() && !tail_hneq_capture_directory.empty()) {
+        throw std::invalid_argument("tail+hneq capture and replay are mutually exclusive");
+    }
+    tail_hneq_replay_directory = path;
+    if (!path.empty()) ensureTailHneqBuffers();
 }
 
 void InamuroCUDA::setUsePoissonSpatialDiagnostics(bool enabled)
@@ -2672,13 +3653,24 @@ void InamuroCUDA::writePoissonDiagnostic(
         << (pressure_converged ? 1 : 0) << ','
         << (fixed_point_converged ? 1 : 0) << ','
         << (use_poisson_dual_residual ? 1 : 0) << ','
-        << (converged ? 1 : 0) << ',';
+        << (converged ? 1 : 0) << ','
+        << last_poisson_diagnostics.shadow_active_h_values_checked << ','
+        << last_poisson_diagnostics.shadow_active_h_mismatches << ','
+        << last_poisson_diagnostics.shadow_active_p_values_checked << ','
+        << last_poisson_diagnostics.shadow_active_p_mismatches << ',';
     if (std::isfinite(block_low_frequency_fraction)) {
         out << block_low_frequency_fraction;
     }
     out << ','
         << (block_count > 0 ? block_size : 0) << ','
-        << block_count << '\n';
+        << block_count << ','
+        << (last_poisson_diagnostics.warm_start_used ? 1 : 0) << ','
+        << (last_poisson_diagnostics.warm_start_first_check_converged ? 1 : 0) << ','
+        << last_poisson_diagnostics.reference_iterations << ','
+        << last_poisson_diagnostics.tail_iteration << ','
+        << last_poisson_diagnostics.warm_start_io_ms << ','
+        << last_poisson_diagnostics.warm_start_restore_max_abs << ','
+        << last_poisson_diagnostics.fallback_count << '\n';
 }
 
 void InamuroCUDA::printPerformanceMetrics() const
@@ -2826,4 +3818,755 @@ void InamuroCUDA::resetPerformanceMetrics()
     perf.poisson_residual_time = 0.0;
     perf.total_poisson_iterations = 0;
     perf.time_step_count = 0;
+}
+
+InamuroCUDA::TBookStageAuditResult
+InamuroCUDA::runTBookStageAudit(const std::string& dump_path)
+{
+    constexpr int nx = 5;
+    constexpr int ny = 4;
+    constexpr int nz = 3;
+    constexpr int nz_total = nz + 2;
+    constexpr int cells = nx * ny * nz;
+    constexpr int macro_cells = nx * ny * nz_total;
+    constexpr int q_count = 15;
+
+    upload_lattice_constants();
+
+    std::vector<double> rho(macro_cells, 1.0);
+    std::vector<double> pressure(macro_cells, 0.0);
+    std::vector<double> u_x(cells), v_y(cells), w_z(cells);
+    std::vector<double> h0(cells * q_count);
+    std::vector<double> cpu_collision(cells * q_count);
+    std::vector<double> cpu_stream(cells * q_count);
+    std::vector<double> cpu_boundary(cells * q_count);
+    std::vector<double> cpu_pressure(cells);
+
+    auto cell_index = [](int x, int y, int z) { return (z * ny + y) * nx + x; };
+    auto macro_index = [](int x, int y, int z) { return ((z + 1) * ny + y) * nx + x; };
+
+    for (int z = 0; z < nz; ++z) {
+        for (int y = 0; y < ny; ++y) {
+            for (int x = 0; x < nx; ++x) {
+                const int cell = cell_index(x, y, z);
+                const int macro = macro_index(x, y, z);
+                rho[macro] = 1.0 + 0.07 * ((cell % 11) + 1);
+                pressure[macro] = 0.2 + 0.013 * cell + 0.001 * std::sin(0.37 * (cell + 1));
+                u_x[cell] = 0.011 * std::sin(0.17 * (cell + 1));
+                v_y[cell] = 0.007 * std::cos(0.23 * (cell + 2));
+                w_z[cell] = -0.005 * std::sin(0.31 * (cell + 3));
+                for (int q = 0; q < q_count; ++q) {
+                    h0[cell * q_count + q] =
+                        D3Q15::Ei[q] * pressure[macro] +
+                        1.0e-4 * (q + 1) * std::sin(0.13 * (cell + 1) * (q + 1));
+                }
+            }
+        }
+    }
+
+    double source_moment_max_abs = 0.0;
+    for (int cell = 0; cell < cells; ++cell) {
+        const double div_u = u_x[cell] + v_y[cell] + w_z[cell];
+        const int z = cell / (nx * ny);
+        const int y = (cell / nx) % ny;
+        const int x = cell % nx;
+        const int macro = macro_index(x, y, z);
+        const double tau_h = 1.0 / rho[macro] + 0.5;
+        double source_sum = 0.0;
+        for (int q = 0; q < q_count; ++q) {
+            const int idx = cell * q_count + q;
+            const double source = -(D3Q15::Ei[q] / 3.0) * div_u;
+            source_sum += source;
+            const double equilibrium = D3Q15::Ei[q] * pressure[macro];
+            cpu_collision[idx] = h0[idx] - (h0[idx] - equilibrium) / tau_h + source;
+        }
+        source_moment_max_abs = std::max(source_moment_max_abs,
+                                         std::abs(source_sum + div_u / 3.0));
+    }
+
+    for (int z = 0; z < nz; ++z) {
+        for (int y = 0; y < ny; ++y) {
+            for (int x = 0; x < nx; ++x) {
+                const int dst = cell_index(x, y, z);
+                for (int q = 0; q < q_count; ++q) {
+                    int xs = x - D3Q15::ex[q];
+                    int ys = y - D3Q15::ey[q];
+                    int zs = z - D3Q15::ez[q];
+                    if (xs < 0) xs += nx; else if (xs >= nx) xs -= nx;
+                    if (ys < 0) ys += ny; else if (ys >= ny) ys -= ny;
+                    if (zs < 0) zs += nz; else if (zs >= nz) zs -= nz;
+                    const int src = cell_index(xs, ys, zs);
+                    cpu_stream[dst * q_count + q] = cpu_collision[src * q_count + q];
+                }
+            }
+        }
+    }
+    cpu_boundary = cpu_stream;
+    constexpr int bounce[5][2] = {{1, 4}, {7, 8}, {9, 14}, {10, 13}, {12, 11}};
+    for (int z = 0; z < nz; ++z) {
+        for (int y = 0; y < ny; ++y) {
+            const int left = cell_index(0, y, z) * q_count;
+            const int right = cell_index(nx - 1, y, z) * q_count;
+            for (const auto& pair : bounce) {
+                cpu_boundary[left + pair[0]] = cpu_boundary[left + pair[1]];
+                cpu_boundary[right + pair[1]] = cpu_boundary[right + pair[0]];
+            }
+        }
+    }
+    for (int cell = 0; cell < cells; ++cell) {
+        double sum = 0.0;
+        for (int q = 0; q < q_count; ++q) sum += cpu_boundary[cell * q_count + q];
+        cpu_pressure[cell] = sum;
+    }
+
+    double *d_h = nullptr, *d_h_tmp = nullptr, *d_p = nullptr, *d_p_tmp = nullptr;
+    double *d_rho = nullptr, *d_ux = nullptr, *d_vy = nullptr, *d_wz = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_h, h0.size() * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_h_tmp, h0.size() * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_p, pressure.size() * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_p_tmp, pressure.size() * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_rho, rho.size() * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_ux, u_x.size() * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_vy, v_y.size() * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_wz, w_z.size() * sizeof(double)));
+    CUDA_CHECK(cudaMemcpy(d_h, h0.data(), h0.size() * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_p, pressure.data(), pressure.size() * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_rho, rho.data(), rho.size() * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_ux, u_x.data(), u_x.size() * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_vy, v_y.data(), v_y.size() * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_wz, w_z.data(), w_z.size() * sizeof(double), cudaMemcpyHostToDevice));
+
+    dim3 block(8, 8, 8);
+    dim3 grid((nx + block.x - 1) / block.x,
+              (ny + block.y - 1) / block.y,
+              (nz + block.z - 1) / block.z);
+    dim3 boundary_block(16, 16);
+    dim3 boundary_grid((ny + boundary_block.x - 1) / boundary_block.x,
+                       (nz + boundary_block.y - 1) / boundary_block.y);
+    dim3 onepass_block(16, 4, 4);
+    dim3 onepass_grid((nx + onepass_block.x - 1) / onepass_block.x,
+                      (ny + onepass_block.y - 1) / onepass_block.y,
+                      (nz + onepass_block.z - 1) / onepass_block.z);
+
+    std::vector<double> gpu_collision(h0.size()), gpu_stream(h0.size()), gpu_boundary(h0.size());
+    std::vector<double> gpu_pressure(cells), gpu_onepass_h(h0.size()), gpu_onepass_p(cells);
+    std::vector<double> macro_download(macro_cells);
+
+    collisionPressureKernel<<<grid, block>>>(d_h, d_p, d_rho, d_ux, d_vy, d_wz,
+                                              nx, ny, nz, nz_total, 1.0);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpy(gpu_collision.data(), d_h, h0.size() * sizeof(double), cudaMemcpyDeviceToHost));
+    streamKernel<<<grid, block>>>(d_h, d_h_tmp, nx, ny, nz);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpy(gpu_stream.data(), d_h_tmp, h0.size() * sizeof(double), cudaMemcpyDeviceToHost));
+    slipBounceBackKernel<<<boundary_grid, boundary_block>>>(d_h_tmp, nx, ny, nz);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpy(gpu_boundary.data(), d_h_tmp, h0.size() * sizeof(double), cudaMemcpyDeviceToHost));
+    computePressureKernel<<<grid, block>>>(d_h_tmp, d_p_tmp, nx, ny, nz, nz_total);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpy(macro_download.data(), d_p_tmp,
+                          macro_download.size() * sizeof(double), cudaMemcpyDeviceToHost));
+    for (int z = 0; z < nz; ++z)
+        for (int y = 0; y < ny; ++y)
+            for (int x = 0; x < nx; ++x)
+                gpu_pressure[cell_index(x, y, z)] = macro_download[macro_index(x, y, z)];
+
+    CUDA_CHECK(cudaMemcpy(d_h, h0.data(), h0.size() * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_p, pressure.data(), pressure.size() * sizeof(double), cudaMemcpyHostToDevice));
+    collisionStreamBoundaryPressureKernel<<<onepass_grid, onepass_block>>>(
+        d_h, d_h_tmp, d_p, d_p_tmp, d_rho, d_ux, d_vy, d_wz,
+        nx, ny, nz, nz_total, 1.0, 1.0);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpy(gpu_onepass_h.data(), d_h_tmp,
+                          gpu_onepass_h.size() * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(macro_download.data(), d_p_tmp,
+                          macro_download.size() * sizeof(double), cudaMemcpyDeviceToHost));
+    for (int z = 0; z < nz; ++z)
+        for (int y = 0; y < ny; ++y)
+            for (int x = 0; x < nx; ++x)
+                gpu_onepass_p[cell_index(x, y, z)] = macro_download[macro_index(x, y, z)];
+
+    double divergence_mean = 0.0;
+    for (int cell = 0; cell < cells; ++cell) divergence_mean += u_x[cell] + v_y[cell] + w_z[cell];
+    divergence_mean /= cells;
+    projectSourceMeanKernel<<<(cells + 255) / 256, 256>>>(d_ux, divergence_mean, cells);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpy(d_h, h0.data(), h0.size() * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_p, pressure.data(), pressure.size() * sizeof(double), cudaMemcpyHostToDevice));
+    collisionStreamBoundaryPressureKernel<<<onepass_grid, onepass_block>>>(
+        d_h, d_h_tmp, d_p, d_p_tmp, d_rho, d_ux, d_vy, d_wz,
+        nx, ny, nz, nz_total, 1.0, 1.0);
+    CUDA_CHECK(cudaGetLastError());
+    std::vector<double> projected_h(h0.size()), projected_p(cells), projected_ux(cells);
+    CUDA_CHECK(cudaMemcpy(projected_h.data(), d_h_tmp, projected_h.size() * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(projected_ux.data(), d_ux, projected_ux.size() * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(macro_download.data(), d_p_tmp,
+                          macro_download.size() * sizeof(double), cudaMemcpyDeviceToHost));
+    for (int z = 0; z < nz; ++z)
+        for (int y = 0; y < ny; ++y)
+            for (int x = 0; x < nx; ++x)
+                projected_p[cell_index(x, y, z)] = macro_download[macro_index(x, y, z)];
+
+    constexpr double audit_gauge_shift = 0.123456789;
+    applyPressureGaugeKernel<<<grid, block>>>(d_p_tmp, d_h_tmp, audit_gauge_shift,
+                                              nx, ny, nz, nz_total);
+    CUDA_CHECK(cudaGetLastError());
+    std::vector<double> gauged_h(h0.size()), gauged_p(cells);
+    CUDA_CHECK(cudaMemcpy(gauged_h.data(), d_h_tmp, gauged_h.size() * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(macro_download.data(), d_p_tmp,
+                          macro_download.size() * sizeof(double), cudaMemcpyDeviceToHost));
+    for (int z = 0; z < nz; ++z)
+        for (int y = 0; y < ny; ++y)
+            for (int x = 0; x < nx; ++x)
+                gauged_p[cell_index(x, y, z)] = macro_download[macro_index(x, y, z)];
+
+    auto max_abs = [](const std::vector<double>& a, const std::vector<double>& b) {
+        if (a.size() != b.size()) throw std::runtime_error("stage audit vector size mismatch");
+        double value = 0.0;
+        for (std::size_t i = 0; i < a.size(); ++i) value = std::max(value, std::abs(a[i] - b[i]));
+        return value;
+    };
+
+    constexpr int fixed_terms = 6;
+    constexpr int fixed_threads = 256;
+    const int fixed_blocks = (cells + fixed_threads - 1) / fixed_threads;
+    double* d_fixed_blocks = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_fixed_blocks,
+                          static_cast<std::size_t>(fixed_blocks) * fixed_terms * sizeof(double)));
+
+    double fixed_gauge = 0.0;
+    for (int z = 0; z < nz; ++z)
+        for (int y = 0; y < ny; ++y)
+            for (int x = 0; x < nx; ++x)
+                fixed_gauge += pressure[macro_index(x, y, z)];
+    fixed_gauge /= cells;
+
+    auto cpu_fixed_terms = [&](const std::vector<double>& live_h,
+                               const std::vector<double>& image_h,
+                               const std::vector<double>& macro_p,
+                               double gauge) {
+        std::array<double, fixed_terms> terms{};
+        for (int z = 0; z < nz; ++z) {
+            for (int y = 0; y < ny; ++y) {
+                for (int x = 0; x < nx; ++x) {
+                    const int cell = cell_index(x, y, z);
+                    double h_sum = 0.0;
+                    for (int q = 0; q < q_count; ++q) {
+                        const double h_value = live_h[cell * q_count + q];
+                        const double image_value = image_h[cell * q_count + q];
+                        const double gauge_equilibrium = D3Q15::Ei[q] * gauge;
+                        terms[0] += std::abs(h_value - image_value);
+                        terms[1] += std::abs(h_value - gauge_equilibrium);
+                        terms[2] += std::abs(image_value - gauge_equilibrium);
+                        h_sum += h_value;
+                    }
+                    const double p_value = macro_p[macro_index(x, y, z)];
+                    terms[3] += std::abs(p_value - h_sum);
+                    terms[4] += std::abs(p_value - gauge);
+                    terms[5] += std::abs(h_sum - gauge);
+                }
+            }
+        }
+        return terms;
+    };
+
+    auto gpu_fixed_terms = [&](const std::vector<double>& live_h,
+                               const std::vector<double>& image_h,
+                               const std::vector<double>& macro_p,
+                               double gauge) {
+        CUDA_CHECK(cudaMemcpy(d_h, live_h.data(), live_h.size() * sizeof(double),
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_h_tmp, image_h.data(), image_h.size() * sizeof(double),
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_p, macro_p.data(), macro_p.size() * sizeof(double),
+                              cudaMemcpyHostToDevice));
+        computePressureKernel<<<grid, block>>>(
+            d_h, d_p_tmp, nx, ny, nz, nz_total);
+        CUDA_CHECK(cudaGetLastError());
+        fixedPointResidualBlockKernel<<<
+            fixed_blocks, fixed_threads,
+            fixed_terms * fixed_threads * sizeof(double)>>>(
+                d_h, d_h_tmp, d_p, d_p_tmp, gauge, d_fixed_blocks,
+                nx, ny, nz, nz_total);
+        CUDA_CHECK(cudaGetLastError());
+        std::vector<double> blocks(static_cast<std::size_t>(fixed_blocks) * fixed_terms);
+        CUDA_CHECK(cudaMemcpy(blocks.data(), d_fixed_blocks,
+                              blocks.size() * sizeof(double), cudaMemcpyDeviceToHost));
+        std::array<double, fixed_terms> sums{};
+        std::array<double, fixed_terms> compensation{};
+        for (int block_index = 0; block_index < fixed_blocks; ++block_index) {
+            for (int term = 0; term < fixed_terms; ++term) {
+                const double value = blocks[static_cast<std::size_t>(block_index) * fixed_terms + term];
+                const double corrected = value - compensation[term];
+                const double updated = sums[term] + corrected;
+                compensation[term] = (updated - sums[term]) - corrected;
+                sums[term] = updated;
+            }
+        }
+        return sums;
+    };
+
+    auto gpu_fixed_map = [&](const std::vector<double>& live_h,
+                             const std::vector<double>& macro_p) {
+        CUDA_CHECK(cudaMemcpy(d_h, live_h.data(), live_h.size() * sizeof(double),
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_p, macro_p.data(), macro_p.size() * sizeof(double),
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_ux, u_x.data(), u_x.size() * sizeof(double),
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_vy, v_y.data(), v_y.size() * sizeof(double),
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_wz, w_z.data(), w_z.size() * sizeof(double),
+                              cudaMemcpyHostToDevice));
+        collisionPressureKernel<<<grid, block>>>(
+            d_h, d_p, d_rho, d_ux, d_vy, d_wz,
+            nx, ny, nz, nz_total, 1.0);
+        CUDA_CHECK(cudaGetLastError());
+        streamKernel<<<grid, block>>>(d_h, d_h_tmp, nx, ny, nz);
+        CUDA_CHECK(cudaGetLastError());
+        slipBounceBackKernel<<<boundary_grid, boundary_block>>>(
+            d_h_tmp, nx, ny, nz);
+        CUDA_CHECK(cudaGetLastError());
+        std::vector<double> image(live_h.size());
+        CUDA_CHECK(cudaMemcpy(image.data(), d_h_tmp,
+                              image.size() * sizeof(double), cudaMemcpyDeviceToHost));
+        return image;
+    };
+
+    const auto fixed_map_base = gpu_fixed_map(h0, pressure);
+    const auto fixed_cpu = cpu_fixed_terms(h0, cpu_boundary, pressure, fixed_gauge);
+    const auto fixed_gpu = gpu_fixed_terms(h0, fixed_map_base, pressure, fixed_gauge);
+    std::vector<double> fp_gauged_h = h0;
+    std::vector<double> fp_gauged_pressure = pressure;
+    constexpr double fp_gauge_shift = 0.2718281828459045;
+    for (int cell = 0; cell < cells; ++cell) {
+        for (int q = 0; q < q_count; ++q) {
+            fp_gauged_h[cell * q_count + q] += D3Q15::Ei[q] * fp_gauge_shift;
+        }
+    }
+    for (int z = 0; z < nz; ++z)
+        for (int y = 0; y < ny; ++y)
+            for (int x = 0; x < nx; ++x)
+                fp_gauged_pressure[macro_index(x, y, z)] += fp_gauge_shift;
+    const auto fp_gauged_image = gpu_fixed_map(
+        fp_gauged_h, fp_gauged_pressure);
+    const auto fixed_gpu_gauged = gpu_fixed_terms(
+        fp_gauged_h, fp_gauged_image, fp_gauged_pressure,
+        fixed_gauge + fp_gauge_shift);
+    const auto fixed_gpu_repeat = gpu_fixed_terms(
+        h0, fixed_map_base, pressure, fixed_gauge);
+
+    TBookStageAuditResult result;
+    result.collision_max_abs = max_abs(cpu_collision, gpu_collision);
+    result.stream_max_abs = max_abs(cpu_stream, gpu_stream);
+    result.boundary_max_abs = max_abs(cpu_boundary, gpu_boundary);
+    result.pressure_max_abs = max_abs(cpu_pressure, gpu_pressure);
+    result.onepass_h_max_abs = max_abs(cpu_boundary, gpu_onepass_h);
+    result.onepass_p_max_abs = max_abs(cpu_pressure, gpu_onepass_p);
+    result.source_moment_max_abs = source_moment_max_abs;
+    double projected_divergence_sum = 0.0;
+    for (int cell = 0; cell < cells; ++cell)
+        projected_divergence_sum += projected_ux[cell] + v_y[cell] + w_z[cell];
+    result.projected_source_mean_abs = std::abs(projected_divergence_sum / (3.0 * cells));
+    auto gradient = [&](const std::vector<double>& values, int x, int y, int z, int component) {
+        const int xe = x == nx - 1 ? nx - 2 : x + 1;
+        const int xw = x == 0 ? 1 : x - 1;
+        const int yn = y == ny - 1 ? 0 : y + 1;
+        const int ys = y == 0 ? ny - 1 : y - 1;
+        const int zn = z == nz - 1 ? 0 : z + 1;
+        const int zs = z == 0 ? nz - 1 : z - 1;
+        if (component == 0) return 0.5 * (values[cell_index(xe, y, z)] - values[cell_index(xw, y, z)]);
+        if (component == 1) return 0.5 * (values[cell_index(x, yn, z)] - values[cell_index(x, ys, z)]);
+        return 0.5 * (values[cell_index(x, y, zn)] - values[cell_index(x, y, zs)]);
+    };
+    for (int z = 0; z < nz; ++z)
+        for (int y = 0; y < ny; ++y)
+            for (int x = 0; x < nx; ++x) {
+                const int cell = cell_index(x, y, z);
+                const int macro = macro_index(x, y, z);
+                for (int component = 0; component < 3; ++component) {
+                    const double raw_grad = gradient(gpu_onepass_p, x, y, z, component);
+                    const double projected_grad = gradient(projected_p, x, y, z, component);
+                    const double gauged_grad = gradient(gauged_p, x, y, z, component);
+                    result.source_projection_gradient_max_abs = std::max(
+                        result.source_projection_gradient_max_abs, std::abs(raw_grad - projected_grad));
+                    result.gauge_gradient_max_abs = std::max(
+                        result.gauge_gradient_max_abs, std::abs(projected_grad - gauged_grad));
+                    result.gauge_correct_uvw_max_abs = std::max(
+                        result.gauge_correct_uvw_max_abs,
+                        std::abs((projected_grad - gauged_grad) / rho[macro]));
+                }
+                double h_sum = 0.0;
+                for (int q = 0; q < q_count; ++q) h_sum += gauged_h[cell * q_count + q];
+    result.gauge_p_sum_h_max_abs = std::max(
+                    result.gauge_p_sum_h_max_abs, std::abs(h_sum - gauged_p[cell]));
+            }
+
+    for (int term = 0; term < fixed_terms; ++term) {
+        result.fixed_point_terms_max_abs = std::max(
+            result.fixed_point_terms_max_abs, std::abs(fixed_cpu[term] - fixed_gpu[term]));
+        result.fixed_point_gauge_max_abs = std::max(
+            result.fixed_point_gauge_max_abs,
+            std::abs(fixed_gpu[term] - fixed_gpu_gauged[term]));
+        result.fixed_point_repeat_max_abs = std::max(
+            result.fixed_point_repeat_max_abs,
+            std::abs(fixed_gpu[term] - fixed_gpu_repeat[term]));
+    }
+    for (int cell = 0; cell < cells; ++cell) {
+        for (int q = 0; q < q_count; ++q) {
+            result.fixed_point_map_gauge_max_abs = std::max(
+                result.fixed_point_map_gauge_max_abs,
+                std::abs((fp_gauged_image[cell * q_count + q] -
+                          D3Q15::Ei[q] * fp_gauge_shift) -
+                         fixed_map_base[cell * q_count + q]));
+        }
+    }
+    auto safe_relative = [](double numerator, double denominator) {
+        if (denominator > 0.0) return numerator / denominator;
+        return numerator == 0.0
+            ? 0.0
+            : std::numeric_limits<double>::infinity();
+    };
+    result.fixed_point_h_relative = safe_relative(
+        fixed_cpu[0], std::max(fixed_cpu[1], fixed_cpu[2]));
+    result.fixed_point_p_relative = safe_relative(
+        fixed_cpu[3], std::max(fixed_cpu[4], fixed_cpu[5]));
+    result.fixed_point_relative = std::max(
+        result.fixed_point_h_relative, result.fixed_point_p_relative);
+
+    std::vector<double> rho_physical(cells), pressure_physical(cells);
+    for (int z = 0; z < nz; ++z)
+        for (int y = 0; y < ny; ++y)
+            for (int x = 0; x < nx; ++x) {
+                const int cell = cell_index(x, y, z);
+                const int macro = macro_index(x, y, z);
+                rho_physical[cell] = rho[macro];
+                pressure_physical[cell] = pressure[macro];
+            }
+    std::ofstream dump(dump_path, std::ios::binary | std::ios::trunc);
+    if (!dump) throw std::runtime_error("failed to open T_book audit dump: " + dump_path);
+    const char magic[8] = {'T', 'B', 'O', 'O', 'K', 'A', '1', '\0'};
+    const std::uint32_t header[4] = {nx, ny, nz, 16};
+    dump.write(magic, sizeof(magic));
+    dump.write(reinterpret_cast<const char*>(header), sizeof(header));
+    auto write_vector = [&](const std::vector<double>& values) {
+        dump.write(reinterpret_cast<const char*>(values.data()),
+                   static_cast<std::streamsize>(values.size() * sizeof(double)));
+    };
+    write_vector(rho_physical); write_vector(pressure_physical); write_vector(h0);
+    write_vector(u_x); write_vector(v_y); write_vector(w_z);
+    write_vector(cpu_collision); write_vector(cpu_stream); write_vector(cpu_boundary); write_vector(cpu_pressure);
+    write_vector(gpu_collision); write_vector(gpu_stream); write_vector(gpu_boundary); write_vector(gpu_pressure);
+    write_vector(gpu_onepass_h); write_vector(gpu_onepass_p);
+    if (!dump) throw std::runtime_error("failed while writing T_book audit dump");
+
+    CUDA_CHECK(cudaFree(d_fixed_blocks));
+    CUDA_CHECK(cudaFree(d_h)); CUDA_CHECK(cudaFree(d_h_tmp));
+    CUDA_CHECK(cudaFree(d_p)); CUDA_CHECK(cudaFree(d_p_tmp)); CUDA_CHECK(cudaFree(d_rho));
+    CUDA_CHECK(cudaFree(d_ux)); CUDA_CHECK(cudaFree(d_vy)); CUDA_CHECK(cudaFree(d_wz));
+    return result;
+}
+
+InamuroCUDA::FixedPointStateAuditResult
+InamuroCUDA::runFixedPointStateAudit(const std::string& state_path)
+{
+    upload_lattice_constants();
+    std::ifstream in(state_path, std::ios::binary | std::ios::ate);
+    if (!in) throw std::runtime_error("cannot open fixed-point state: " + state_path);
+    const std::uint64_t file_bytes = static_cast<std::uint64_t>(in.tellg());
+    in.seekg(0);
+    char magic[8]{};
+    std::uint32_t h32[10]{};
+    std::uint64_t h64[3]{};
+    double hf64[2]{};
+    in.read(magic, sizeof(magic));
+    in.read(reinterpret_cast<char*>(h32), sizeof(h32));
+    in.read(reinterpret_cast<char*>(h64), sizeof(h64));
+    in.read(reinterpret_cast<char*>(hf64), sizeof(hf64));
+    const char expected_magic[8] = {'C', 'L', 'B', 'M', 'K', '0', '1', '\0'};
+    if (!in || !std::equal(std::begin(magic), std::end(magic),
+                           std::begin(expected_magic))) {
+        throw std::runtime_error("invalid fixed-point state header");
+    }
+    const int nx = static_cast<int>(h32[2]);
+    const int ny = static_cast<int>(h32[3]);
+    const int nz = static_cast<int>(h32[4]);
+    const int nz_total = static_cast<int>(h32[5]);
+    const std::uint32_t step = h32[7];
+    const std::uint64_t iteration = h64[0];
+    const std::uint64_t cells64 = h64[1];
+    const std::uint64_t payload_values = h64[2];
+    if (h32[0] != 0x01020304u || h32[1] != 8u || h32[6] != 15u ||
+        h32[8] != 6u || h32[9] != 1u || nx <= 0 || ny <= 0 || nz <= 0 ||
+        nz_total != nz + 2 || hf64[1] != 1.0) {
+        throw std::runtime_error("unsupported fixed-point state contract");
+    }
+    const std::uint64_t expected_cells = checkedMultiply(
+        checkedMultiply(static_cast<std::uint64_t>(nx), ny,
+                        "state nx*ny"), nz, "state cells");
+    if (cells64 != expected_cells ||
+        payload_values != checkedMultiply(cells64, 20, "state payload values")) {
+        throw std::runtime_error("fixed-point state size metadata mismatch");
+    }
+    const std::uint64_t expected_bytes = 88u +
+        checkedMultiply(payload_values, sizeof(double), "state payload bytes");
+    if (file_bytes != expected_bytes ||
+        cells64 > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("fixed-point state file length mismatch");
+    }
+    const int cells = static_cast<int>(cells64);
+    std::vector<double> p(cells), rho(cells), u_x(cells), v_y(cells), w_z(cells);
+    std::vector<double> h(static_cast<std::size_t>(cells) * 15);
+    auto read_values = [&](std::vector<double>& values) {
+        in.read(reinterpret_cast<char*>(values.data()),
+                static_cast<std::streamsize>(values.size() * sizeof(double)));
+    };
+    read_values(p); read_values(rho); read_values(u_x);
+    read_values(v_y); read_values(w_z); read_values(h);
+    if (!in) throw std::runtime_error("truncated fixed-point state payload");
+
+    FixedPointStateAuditResult result;
+    result.step = step;
+    result.iteration = iteration;
+    result.cells = cells64;
+    auto count_nonfinite = [&](const std::vector<double>& values) {
+        for (double value : values) {
+            if (!std::isfinite(value)) ++result.nonfinite_values;
+        }
+    };
+    count_nonfinite(p); count_nonfinite(rho); count_nonfinite(u_x);
+    count_nonfinite(v_y); count_nonfinite(w_z); count_nonfinite(h);
+    if (result.nonfinite_values != 0) return result;
+
+    auto cell_index = [=](int x, int y, int z) {
+        return (z * ny + y) * nx + x;
+    };
+    std::vector<double> cpu_collision(h.size()), cpu_stream(h.size()),
+                        cpu_boundary(h.size());
+    std::vector<double> cpu_live_pressure(cells), cpu_image_pressure(cells);
+    for (int cell = 0; cell < cells; ++cell) {
+        const double tau_h = 1.0 / rho[cell] + 0.5;
+        const double div_u = u_x[cell] + v_y[cell] + w_z[cell];
+        for (int q = 0; q < 15; ++q) {
+            const std::size_t idx = static_cast<std::size_t>(cell) * 15 + q;
+            const double equilibrium = D3Q15::Ei[q] * p[cell];
+            cpu_collision[idx] = h[idx] - (h[idx] - equilibrium) / tau_h -
+                                 (D3Q15::Ei[q] / 3.0) * div_u;
+        }
+    }
+    for (int z = 0; z < nz; ++z) {
+        for (int y = 0; y < ny; ++y) {
+            for (int x = 0; x < nx; ++x) {
+                const int dst = cell_index(x, y, z);
+                for (int q = 0; q < 15; ++q) {
+                    int xs = x - D3Q15::ex[q];
+                    int ys = y - D3Q15::ey[q];
+                    int zs = z - D3Q15::ez[q];
+                    if (xs < 0) xs += nx; else if (xs >= nx) xs -= nx;
+                    if (ys < 0) ys += ny; else if (ys >= ny) ys -= ny;
+                    if (zs < 0) zs += nz; else if (zs >= nz) zs -= nz;
+                    const int src = cell_index(xs, ys, zs);
+                    cpu_stream[static_cast<std::size_t>(dst) * 15 + q] =
+                        cpu_collision[static_cast<std::size_t>(src) * 15 + q];
+                }
+            }
+        }
+    }
+    cpu_boundary = cpu_stream;
+    constexpr int bounce[5][2] = {
+        {1, 4}, {7, 8}, {9, 14}, {10, 13}, {12, 11}};
+    for (int z = 0; z < nz; ++z) {
+        for (int y = 0; y < ny; ++y) {
+            const std::size_t left =
+                static_cast<std::size_t>(cell_index(0, y, z)) * 15;
+            const std::size_t right =
+                static_cast<std::size_t>(cell_index(nx - 1, y, z)) * 15;
+            for (const auto& pair : bounce) {
+                cpu_boundary[left + pair[0]] = cpu_boundary[left + pair[1]];
+                cpu_boundary[right + pair[1]] = cpu_boundary[right + pair[0]];
+            }
+        }
+    }
+    for (int cell = 0; cell < cells; ++cell) {
+        double live_sum = 0.0;
+        double image_sum = 0.0;
+        for (int q = 0; q < 15; ++q) {
+            const std::size_t idx = static_cast<std::size_t>(cell) * 15 + q;
+            live_sum += h[idx];
+            image_sum += cpu_boundary[idx];
+        }
+        cpu_live_pressure[cell] = live_sum;
+        cpu_image_pressure[cell] = image_sum;
+    }
+
+    const std::size_t macro_cells =
+        static_cast<std::size_t>(nx) * ny * nz_total;
+    std::vector<double> macro_p(macro_cells,
+                                std::numeric_limits<double>::quiet_NaN());
+    std::vector<double> macro_rho(macro_cells,
+                                  std::numeric_limits<double>::quiet_NaN());
+    const std::size_t plane = static_cast<std::size_t>(nx) * ny;
+    std::copy(p.begin(), p.end(), macro_p.begin() + plane);
+    std::copy(rho.begin(), rho.end(), macro_rho.begin() + plane);
+
+    double *d_h = nullptr, *d_h_tmp = nullptr, *d_p = nullptr,
+           *d_p_tmp = nullptr, *d_rho = nullptr;
+    double *d_ux = nullptr, *d_vy = nullptr, *d_wz = nullptr,
+           *d_fixed = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_h, h.size() * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_h_tmp, h.size() * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_p, macro_p.size() * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_p_tmp, macro_p.size() * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_rho, macro_rho.size() * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_ux, u_x.size() * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_vy, v_y.size() * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_wz, w_z.size() * sizeof(double)));
+    const int reduction_blocks = (cells + 255) / 256;
+    CUDA_CHECK(cudaMalloc(&d_fixed,
+                          static_cast<std::size_t>(reduction_blocks) * 6 * sizeof(double)));
+    CUDA_CHECK(cudaMemcpy(d_rho, macro_rho.data(), macro_rho.size() * sizeof(double),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_ux, u_x.data(), u_x.size() * sizeof(double),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_vy, v_y.data(), v_y.size() * sizeof(double),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_wz, w_z.data(), w_z.size() * sizeof(double),
+                          cudaMemcpyHostToDevice));
+
+    dim3 block(8, 8, 8);
+    dim3 grid((nx + block.x - 1) / block.x,
+              (ny + block.y - 1) / block.y,
+              (nz + block.z - 1) / block.z);
+    dim3 boundary_block(16, 16);
+    dim3 boundary_grid((ny + boundary_block.x - 1) / boundary_block.x,
+                       (nz + boundary_block.y - 1) / boundary_block.y);
+    auto upload_hp = [&](const std::vector<double>& h_values,
+                         const std::vector<double>& p_values) {
+        CUDA_CHECK(cudaMemcpy(d_h, h_values.data(), h_values.size() * sizeof(double),
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_p, p_values.data(), p_values.size() * sizeof(double),
+                              cudaMemcpyHostToDevice));
+    };
+    upload_hp(h, macro_p);
+    collisionPressureKernel<<<grid, block>>>(
+        d_h, d_p, d_rho, d_ux, d_vy, d_wz,
+        nx, ny, nz, nz_total, 1.0);
+    CUDA_CHECK(cudaGetLastError());
+    std::vector<double> gpu_collision(h.size()), gpu_stream(h.size()),
+                        gpu_boundary(h.size());
+    CUDA_CHECK(cudaMemcpy(gpu_collision.data(), d_h,
+                          h.size() * sizeof(double), cudaMemcpyDeviceToHost));
+    streamKernel<<<grid, block>>>(d_h, d_h_tmp, nx, ny, nz);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpy(gpu_stream.data(), d_h_tmp,
+                          h.size() * sizeof(double), cudaMemcpyDeviceToHost));
+    slipBounceBackKernel<<<boundary_grid, boundary_block>>>(
+        d_h_tmp, nx, ny, nz);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpy(gpu_boundary.data(), d_h_tmp,
+                          h.size() * sizeof(double), cudaMemcpyDeviceToHost));
+    computePressureKernel<<<grid, block>>>(
+        d_h_tmp, d_p_tmp, nx, ny, nz, nz_total);
+    CUDA_CHECK(cudaGetLastError());
+    std::vector<double> macro_download(macro_cells), gpu_image_pressure(cells),
+                        gpu_live_pressure(cells);
+    CUDA_CHECK(cudaMemcpy(macro_download.data(), d_p_tmp,
+                          macro_cells * sizeof(double), cudaMemcpyDeviceToHost));
+    std::copy(macro_download.begin() + plane,
+              macro_download.begin() + plane + cells,
+              gpu_image_pressure.begin());
+    CUDA_CHECK(cudaMemcpy(d_h, h.data(), h.size() * sizeof(double),
+                          cudaMemcpyHostToDevice));
+    computePressureKernel<<<grid, block>>>(
+        d_h, d_p_tmp, nx, ny, nz, nz_total);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpy(macro_download.data(), d_p_tmp,
+                          macro_cells * sizeof(double), cudaMemcpyDeviceToHost));
+    std::copy(macro_download.begin() + plane,
+              macro_download.begin() + plane + cells,
+              gpu_live_pressure.begin());
+
+    auto max_abs = [](const std::vector<double>& a,
+                      const std::vector<double>& b) {
+        if (a.size() != b.size()) throw std::runtime_error("audit vector size mismatch");
+        double value = 0.0;
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            value = std::max(value, std::abs(a[i] - b[i]));
+        }
+        return value;
+    };
+    result.collision_max_abs = max_abs(cpu_collision, gpu_collision);
+    result.stream_max_abs = max_abs(cpu_stream, gpu_stream);
+    result.boundary_max_abs = max_abs(cpu_boundary, gpu_boundary);
+    result.live_pressure_max_abs = max_abs(cpu_live_pressure, gpu_live_pressure);
+    result.image_pressure_max_abs = max_abs(cpu_image_pressure, gpu_image_pressure);
+
+    std::array<double, 6> cpu_terms{};
+    for (int cell = 0; cell < cells; ++cell) {
+        for (int q = 0; q < 15; ++q) {
+            const std::size_t idx = static_cast<std::size_t>(cell) * 15 + q;
+            const double eq_gauge = D3Q15::Ei[q] * hf64[0];
+            cpu_terms[0] += std::abs(h[idx] - cpu_boundary[idx]);
+            cpu_terms[1] += std::abs(h[idx] - eq_gauge);
+            cpu_terms[2] += std::abs(cpu_boundary[idx] - eq_gauge);
+        }
+        cpu_terms[3] += std::abs(p[cell] - cpu_live_pressure[cell]);
+        cpu_terms[4] += std::abs(p[cell] - hf64[0]);
+        cpu_terms[5] += std::abs(cpu_live_pressure[cell] - hf64[0]);
+    }
+    // d_h contains the restored live state, d_h_tmp the production map image,
+    // d_p the candidate pressure, and d_p_tmp production sum(live h).
+    fixedPointResidualBlockKernel<<<
+        reduction_blocks, 256, 6 * 256 * sizeof(double)>>>(
+            d_h, d_h_tmp, d_p, d_p_tmp, hf64[0], d_fixed,
+            nx, ny, nz, nz_total);
+    CUDA_CHECK(cudaGetLastError());
+    const auto gpu_terms = copyAndKahanReduce(d_fixed, reduction_blocks, 6);
+    for (int term = 0; term < 6; ++term) {
+        const double scale = std::max(
+            {1.0, std::abs(cpu_terms[term]), std::abs(gpu_terms[term])});
+        result.fixed_point_terms_relative_max_abs = std::max(
+            result.fixed_point_terms_relative_max_abs,
+            std::abs(cpu_terms[term] - gpu_terms[term]) / scale);
+    }
+
+    constexpr double gauge_shift = 0.2718281828459045;
+    std::vector<double> shifted_h = h;
+    std::vector<double> shifted_p = macro_p;
+    for (int cell = 0; cell < cells; ++cell) {
+        for (int q = 0; q < 15; ++q) {
+            shifted_h[static_cast<std::size_t>(cell) * 15 + q] +=
+                D3Q15::Ei[q] * gauge_shift;
+        }
+        shifted_p[plane + cell] += gauge_shift;
+    }
+    upload_hp(shifted_h, shifted_p);
+    collisionPressureKernel<<<grid, block>>>(
+        d_h, d_p, d_rho, d_ux, d_vy, d_wz,
+        nx, ny, nz, nz_total, 1.0);
+    CUDA_CHECK(cudaGetLastError());
+    streamKernel<<<grid, block>>>(d_h, d_h_tmp, nx, ny, nz);
+    CUDA_CHECK(cudaGetLastError());
+    slipBounceBackKernel<<<boundary_grid, boundary_block>>>(
+        d_h_tmp, nx, ny, nz);
+    CUDA_CHECK(cudaGetLastError());
+    std::vector<double> shifted_image(h.size());
+    CUDA_CHECK(cudaMemcpy(shifted_image.data(), d_h_tmp,
+                          h.size() * sizeof(double), cudaMemcpyDeviceToHost));
+    for (int cell = 0; cell < cells; ++cell) {
+        for (int q = 0; q < 15; ++q) {
+            const std::size_t idx = static_cast<std::size_t>(cell) * 15 + q;
+            result.gauge_map_max_abs = std::max(
+                result.gauge_map_max_abs,
+                std::abs((shifted_image[idx] - D3Q15::Ei[q] * gauge_shift) -
+                         gpu_boundary[idx]));
+        }
+    }
+
+    CUDA_CHECK(cudaFree(d_fixed));
+    CUDA_CHECK(cudaFree(d_h)); CUDA_CHECK(cudaFree(d_h_tmp));
+    CUDA_CHECK(cudaFree(d_p)); CUDA_CHECK(cudaFree(d_p_tmp));
+    CUDA_CHECK(cudaFree(d_rho)); CUDA_CHECK(cudaFree(d_ux));
+    CUDA_CHECK(cudaFree(d_vy)); CUDA_CHECK(cudaFree(d_wz));
+    return result;
 }

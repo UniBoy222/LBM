@@ -1,5 +1,10 @@
 __pycache__/
 lbm_gpu
+tbook_stage_audit
+fixed_point_state_audit
+real_state_cross_audit
+oracle_pressure_routes
+tail_hneq_warmstart_oracle
 *.o
 *.plt
 *.bin

@@ -1,0 +1,303 @@
+{
+  "dtype": "float64",
+  "formula": {
+    "collision": "h-E_relax*(h-E_i*p)/(1/rho+1/2)-(E_i/3)*(u_x+v_y+w_z)",
+    "r_h": "h-BS[C(h,p)]",
+    "r_p": "p-sum_i(h_i)"
+  },
+  "pass": true,
+  "schema": "fixed-point-real-state-torch-audit-v1",
+  "source_indexing": {
+    "boundary": "x-slip pairs (1,4),(7,8),(9,14),(10,13),(12,11)",
+    "cell": "(z * ny + y) * nx + x",
+    "distribution": "cell * 15 + q",
+    "stream": "periodic pull from (x-ex[q], y-ey[q], z-ez[q])"
+  },
+  "states": [
+    {
+      "cpu_cuda_component_max_abs": {
+        "boundary_max_abs": 0.0,
+        "collision_max_abs": 0.0,
+        "pressure_image_max_abs": 0.0,
+        "r_h_max_abs": 0.0,
+        "r_p_max_abs": 0.0,
+        "stream_max_abs": 0.0
+      },
+      "finite_nonzero_gate": true,
+      "header": {
+        "cells": 589824,
+        "gauge_target": 0.0,
+        "iteration": 6600,
+        "layout": "cell-major/q-minor",
+        "nx": 48,
+        "ny": 96,
+        "nz": 128,
+        "nz_total": 130,
+        "payload_values": 11796480,
+        "pressure_relax_scale": 1.0,
+        "q": 15,
+        "step": 1
+      },
+      "header_contract": {
+        "cell_count": true,
+        "endian": true,
+        "field_count": true,
+        "float_bytes": true,
+        "gauge_target_finite": true,
+        "layout": true,
+        "nz_total": true,
+        "payload_values": true,
+        "positive_dimensions": true,
+        "pressure_relax_scale_finite": true,
+        "q": true,
+        "strict_unit_pressure_relax": true
+      },
+      "input_finite": {
+        "h": true,
+        "p": true,
+        "rho": true,
+        "u_x": true,
+        "v_y": true,
+        "w_z": true
+      },
+      "pass": true,
+      "state_file": "/home/jzh/whileLBM_tail_hneq_oracle_v1/results/tail_hneq_stage0_v1/real_state/states/fixed_state_step0001_iter00006600.bin",
+      "state_sha256": "bb5953f200fbaaf00f63acfad9f2fd84d2a94ab3193573e8c59b0acfcfee3b21",
+      "tolerance": 1e-12,
+      "torch_cpu": {
+        "device": "cpu",
+        "elapsed_seconds": 1.902551488004974,
+        "gauge_full_map": {
+          "boundary_covariance_max_abs": 8.326672684688674e-17,
+          "collision_covariance_max_abs": 8.326672684688674e-17,
+          "combined_relative_invariance_abs": 1.028975624324524e-17,
+          "pressure_image_covariance_max_abs": 5.551115123125783e-16,
+          "r_h_invariance_max_abs": 9.71445146547012e-17,
+          "r_p_invariance_max_abs": 4.996003610813204e-16,
+          "stream_covariance_max_abs": 8.326672684688674e-17
+        },
+        "gauge_target": {
+          "absolute_error": 1.5419764230904951e-18,
+          "pressure_mean": 1.5419764230904951e-18,
+          "target": 0.0
+        },
+        "pressure_jvp": {
+          "finite": true,
+          "l2": 486.0047040912737,
+          "linf": 1.0000012715657551,
+          "nonzero": true
+        },
+        "pressure_vjp_gradient": {
+          "finite": true,
+          "l2": 0.0007983046442200229,
+          "linf": 1.7065889234479846e-06,
+          "nonzero": true
+        },
+        "residual_terms": {
+          "combined_relative": 9.100951970847374e-06,
+          "finite": true,
+          "r_h_l1": 0.24197869611317321,
+          "r_h_linf": 2.56912481870486e-06,
+          "r_h_relative": 9.100951970847374e-06,
+          "r_h_rms": 7.489426589727656e-08,
+          "r_h_scale": 26588.284048557944,
+          "r_p_l1": 2.9691979804751314e-12,
+          "r_p_linf": 6.661338147750939e-16,
+          "r_p_relative": 1.1179328203817037e-16,
+          "r_p_rms": 1.4793045969068598e-17,
+          "r_p_scale": 26559.717420777906
+        }
+      },
+      "torch_cuda": {
+        "device": "cuda",
+        "elapsed_seconds": 0.3348857759992825,
+        "gauge_full_map": {
+          "boundary_covariance_max_abs": 8.326672684688674e-17,
+          "collision_covariance_max_abs": 8.326672684688674e-17,
+          "combined_relative_invariance_abs": 1.027789778198368e-17,
+          "pressure_image_covariance_max_abs": 5.551115123125783e-16,
+          "r_h_invariance_max_abs": 9.71445146547012e-17,
+          "r_p_invariance_max_abs": 4.996003610813204e-16,
+          "stream_covariance_max_abs": 8.326672684688674e-17
+        },
+        "gauge_target": {
+          "absolute_error": 1.2939839990888194e-18,
+          "pressure_mean": 1.2939839990888194e-18,
+          "target": 0.0
+        },
+        "pressure_jvp": {
+          "finite": true,
+          "l2": 486.00470409127377,
+          "linf": 1.0000012715657551,
+          "nonzero": true
+        },
+        "pressure_vjp_gradient": {
+          "finite": true,
+          "l2": 0.0007983046442198593,
+          "linf": 1.7065889234479846e-06,
+          "nonzero": true
+        },
+        "residual_terms": {
+          "combined_relative": 9.100951970847372e-06,
+          "finite": true,
+          "r_h_l1": 0.2419786961131732,
+          "r_h_linf": 2.56912481870486e-06,
+          "r_h_relative": 9.100951970847372e-06,
+          "r_h_rms": 7.489426589727656e-08,
+          "r_h_scale": 26588.284048557947,
+          "r_p_l1": 2.9691979804751314e-12,
+          "r_p_linf": 6.661338147750939e-16,
+          "r_p_relative": 1.1179328203817035e-16,
+          "r_p_rms": 1.4793045969068598e-17,
+          "r_p_scale": 26559.71742077791
+        }
+      },
+      "worst_gated_numerical_error": 5.551115123125783e-16
+    },
+    {
+      "cpu_cuda_component_max_abs": {
+        "boundary_max_abs": 1.3877787807814457e-17,
+        "collision_max_abs": 1.3877787807814457e-17,
+        "pressure_image_max_abs": 1.1102230246251565e-16,
+        "r_h_max_abs": 1.3877787807814457e-17,
+        "r_p_max_abs": 0.0,
+        "stream_max_abs": 1.3877787807814457e-17
+      },
+      "finite_nonzero_gate": true,
+      "header": {
+        "cells": 589824,
+        "gauge_target": 1.343206024801486e-18,
+        "iteration": 10300,
+        "layout": "cell-major/q-minor",
+        "nx": 48,
+        "ny": 96,
+        "nz": 128,
+        "nz_total": 130,
+        "payload_values": 11796480,
+        "pressure_relax_scale": 1.0,
+        "q": 15,
+        "step": 2
+      },
+      "header_contract": {
+        "cell_count": true,
+        "endian": true,
+        "field_count": true,
+        "float_bytes": true,
+        "gauge_target_finite": true,
+        "layout": true,
+        "nz_total": true,
+        "payload_values": true,
+        "positive_dimensions": true,
+        "pressure_relax_scale_finite": true,
+        "q": true,
+        "strict_unit_pressure_relax": true
+      },
+      "input_finite": {
+        "h": true,
+        "p": true,
+        "rho": true,
+        "u_x": true,
+        "v_y": true,
+        "w_z": true
+      },
+      "pass": true,
+      "state_file": "/home/jzh/whileLBM_tail_hneq_oracle_v1/results/tail_hneq_stage0_v1/real_state/states/fixed_state_step0002_iter00010300.bin",
+      "state_sha256": "90f15d4ec416d405231a70099f08c7ff47615f19f6868057f679ca0b8d4a1502",
+      "tolerance": 1e-12,
+      "torch_cpu": {
+        "device": "cpu",
+        "elapsed_seconds": 1.83518572000321,
+        "gauge_full_map": {
+          "boundary_covariance_max_abs": 1.1102230246251565e-16,
+          "collision_covariance_max_abs": 1.1102230246251565e-16,
+          "combined_relative_invariance_abs": 2.788279996430651e-16,
+          "pressure_image_covariance_max_abs": 6.661338147750939e-16,
+          "r_h_invariance_max_abs": 1.3877787807814457e-16,
+          "r_p_invariance_max_abs": 6.661338147750939e-16,
+          "stream_covariance_max_abs": 1.1102230246251565e-16
+        },
+        "gauge_target": {
+          "absolute_error": 1.8672370748361476e-19,
+          "pressure_mean": 1.1564823173178713e-18,
+          "target": 1.343206024801486e-18
+        },
+        "pressure_jvp": {
+          "finite": true,
+          "l2": 486.05924241262795,
+          "linf": 1.0000012715657551,
+          "nonzero": true
+        },
+        "pressure_vjp_gradient": {
+          "finite": true,
+          "l2": 0.0007983059939360432,
+          "linf": 1.7065889234479846e-06,
+          "nonzero": true
+        },
+        "residual_terms": {
+          "combined_relative": 1.0030344876354436e-05,
+          "finite": true,
+          "r_h_l1": 0.05964299761722733,
+          "r_h_linf": 1.3843850511785494e-06,
+          "r_h_relative": 1.0030344876354436e-05,
+          "r_h_rms": 3.225921278187256e-08,
+          "r_h_scale": 5946.255921651298,
+          "r_p_l1": 1.0708125799783645e-12,
+          "r_p_linf": 6.661338147750939e-16,
+          "r_p_relative": 1.8252807071736864e-16,
+          "r_p_rms": 1.2482853255008456e-17,
+          "r_p_scale": 5866.563842864693
+        }
+      },
+      "torch_cuda": {
+        "device": "cuda",
+        "elapsed_seconds": 0.099127793990192,
+        "gauge_full_map": {
+          "boundary_covariance_max_abs": 1.1102230246251565e-16,
+          "collision_covariance_max_abs": 1.1102230246251565e-16,
+          "combined_relative_invariance_abs": 2.787873420615969e-16,
+          "pressure_image_covariance_max_abs": 6.661338147750939e-16,
+          "r_h_invariance_max_abs": 1.3877787807814457e-16,
+          "r_p_invariance_max_abs": 6.661338147750939e-16,
+          "stream_covariance_max_abs": 1.1102230246251565e-16
+        },
+        "gauge_target": {
+          "absolute_error": 2.2888712530249553e-19,
+          "pressure_mean": 1.1143188994989906e-18,
+          "target": 1.343206024801486e-18
+        },
+        "pressure_jvp": {
+          "finite": true,
+          "l2": 486.059242412628,
+          "linf": 1.0000012715657551,
+          "nonzero": true
+        },
+        "pressure_vjp_gradient": {
+          "finite": true,
+          "l2": 0.0007983059939358799,
+          "linf": 1.7065889234479846e-06,
+          "nonzero": true
+        },
+        "residual_terms": {
+          "combined_relative": 1.003034487635449e-05,
+          "finite": true,
+          "r_h_l1": 0.05964299761722765,
+          "r_h_linf": 1.3843850511785494e-06,
+          "r_h_relative": 1.003034487635449e-05,
+          "r_h_rms": 3.225921278187254e-08,
+          "r_h_scale": 5946.255921651298,
+          "r_p_l1": 1.0708125799783645e-12,
+          "r_p_linf": 6.661338147750939e-16,
+          "r_p_relative": 1.8252807071736864e-16,
+          "r_p_rms": 1.2482853255008456e-17,
+          "r_p_scale": 5866.563842864693
+        }
+      },
+      "worst_gated_numerical_error": 6.661338147750939e-16
+    }
+  ],
+  "tolerance": 1e-12,
+  "torch_cuda_device": "NVIDIA GeForce RTX 5080",
+  "torch_cuda_version": "12.8",
+  "torch_version": "2.11.0+cu128",
+  "worst_gated_numerical_error": 6.661338147750939e-16
+}

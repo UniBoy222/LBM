@@ -1,0 +1,111 @@
+{
+  "all_20_steps_non_degraded": true,
+  "all_replay_gates_passed": true,
+  "baseline_total_e2e_ms": {
+    "iqr": 301.0635509999993,
+    "max": 157552.523296,
+    "median": 157387.828253,
+    "min": 157095.93360699998,
+    "q1": 157222.956412,
+    "q3": 157524.019963,
+    "values": [
+      157524.019963,
+      157552.523296,
+      157387.828253,
+      157095.93360699998,
+      157222.956412
+    ]
+  },
+  "baseline_total_iterations": [
+    130600,
+    130600,
+    130600,
+    130600,
+    130600
+  ],
+  "benchmark_io_contract": {
+    "baseline_capture_disabled": true,
+    "poisson_diagnostics_disabled": true,
+    "reference_validation_excluded_from_timing": true,
+    "replay_artifact_read_restore_included": true
+  },
+  "correctness_20_step": {
+    "baseline_total_iterations": 130600,
+    "fallback_count": 0,
+    "finite_count": 20,
+    "first_check_count": 20,
+    "gate_passed": true,
+    "iteration_reduction_fraction": 0.9846860643185299,
+    "max_fixed_point_residual": 1.0725536288588343e-05,
+    "max_pressure_residual": 0.0009993306985713183,
+    "max_restore_abs": 2.220446049250313e-15,
+    "maxima": {
+      "centroid_distance_normalized": 0.0,
+      "fei_rel_l2": 1.7789481020778408e-16,
+      "h_equilibrium_max_abs": 0.0,
+      "h_moment_rel_l2": 1.3088504259709946e-15,
+      "h_p_consistency_max_abs": 4.440892098500626e-16,
+      "largest_component_rel": 0.0,
+      "mass_rel": 4.1050658935536496e-18,
+      "max_field_rel": 6.929244850797704e-15,
+      "p_demeaned_rel_l2": 1.3063129122793587e-15,
+      "p_raw_rel_l2": 1.306627487248048e-15,
+      "pressure_correction_rel_l2": 6.929244850797704e-15,
+      "pressure_gradient_rel_l2": 4.384659269492467e-15,
+      "rho_rel_l2": 1.224184033695511e-16,
+      "shape_dice_error": 0.0,
+      "shape_mismatch_fraction": 0.0,
+      "u_rel_l2": 3.0516714163681316e-15,
+      "v_rel_l2": 3.0320745630653872e-15,
+      "velocity_rel_l2": 2.337280031492501e-15,
+      "w_rel_l2": 1.777777700942689e-15
+    },
+    "replay_total_iterations": 2000
+  },
+  "e2e_reduction_fraction": 0.9628731056025064,
+  "formal_repeats_per_route": 5,
+  "iteration_reduction_fraction": 0.9846860643185299,
+  "per_step_non_degraded_count": 20,
+  "quantiles": "Hyndman-Fan Type 7",
+  "replay_total_e2e_ms": {
+    "iqr": 12.158852999999908,
+    "max": 7621.808063,
+    "median": 5843.321279,
+    "min": 5797.290709,
+    "q1": 5836.156925,
+    "q3": 5848.315778,
+    "values": [
+      5843.321279,
+      7621.808063,
+      5797.290709,
+      5848.315778,
+      5836.156925
+    ]
+  },
+  "replay_total_iterations": [
+    2000,
+    2000,
+    2000,
+    2000,
+    2000
+  ],
+  "replay_warm_start_io_ms": {
+    "iqr": 27.255953999999747,
+    "max": 4912.489509,
+    "median": 3141.681359,
+    "min": 3102.218833,
+    "q1": 3136.936869,
+    "q3": 3164.192823,
+    "values": [
+      3141.681359,
+      4912.489509,
+      3102.218833,
+      3164.192823,
+      3136.936869
+    ]
+  },
+  "schema": "tail-hneq-warmstart-timing-v1",
+  "speedup": 26.93465252691611,
+  "timer": "sum of 20 per-step performTimeStepGPU pre-call to post-synchronize intervals",
+  "warmup_runs_per_route": 1
+}
