@@ -1,0 +1,12 @@
+CPU/lbm_sim
+GPU/lbm_gpu
+CPU/*.o
+GPU/*.o
+CPU/out/
+GPU/out/
+__pycache__/
+*.pyc
+*.plt
+*.bin
+*.log
+*.csv

@@ -1,0 +1,8 @@
+__pycache__/
+lbm_gpu
+*.o
+*.plt
+*.bin
+*.log
+*.csv
+out/
