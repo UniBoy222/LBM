@@ -1,0 +1,5 @@
+__pycache__/
+lbm_gpu
+lbm_compare
+*.o
+pinn_restart_assets/legacy_archive/
