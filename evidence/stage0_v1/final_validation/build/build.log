@@ -1,0 +1,4 @@
+nvcc -std=c++17 -O3 -arch=sm_120 -I. -I../CPU InamuroCUDA.cu Inamuro.cpp InamuroSolver.cpp common.cpp main.cpp -o lbm_gpu
+nvcc -std=c++17 -O3 -arch=sm_120 -I. -I../CPU InamuroCUDA.cu Inamuro.cpp InamuroSolver.cpp common.cpp tbook_stage_audit.cpp -o tbook_stage_audit
+nvcc -std=c++17 -O3 -arch=sm_120 -I. -I../CPU InamuroCUDA.cu Inamuro.cpp InamuroSolver.cpp common.cpp fixed_point_state_audit.cpp -o fixed_point_state_audit
+nvcc -std=c++17 -O3 -arch=sm_120 -I. -I../CPU InamuroCUDA.cu Inamuro.cpp InamuroSolver.cpp common.cpp oracle_pressure_routes.cpp -o oracle_pressure_routes

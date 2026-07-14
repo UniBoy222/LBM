@@ -1,0 +1,45 @@
+{
+  "coordinate_mismatches": 0,
+  "dims": [
+    48,
+    96,
+    128
+  ],
+  "fields": {
+    "fei": {
+      "max_abs": 0.0,
+      "mismatched_values": 0,
+      "rel_l2": 0.0
+    },
+    "p": {
+      "max_abs": 2.3283064365386963e-10,
+      "mismatched_values": 6,
+      "rel_l2": 8.688974497429493e-12
+    },
+    "rho": {
+      "max_abs": 0.0,
+      "mismatched_values": 0,
+      "rel_l2": 0.0
+    },
+    "u": {
+      "max_abs": 6.938893903907228e-18,
+      "mismatched_values": 6147,
+      "rel_l2": 3.4384715353284804e-17
+    },
+    "v": {
+      "max_abs": 6.64229903085348e-17,
+      "mismatched_values": 11209,
+      "rel_l2": 1.5281275149314474e-16
+    },
+    "w": {
+      "max_abs": 4.440892098500626e-16,
+      "mismatched_values": 8842,
+      "rel_l2": 1.1409548403896122e-16
+    }
+  },
+  "finite": true,
+  "left": "/home/jzh/whileLBM_dualresidual_v1/evidence/stage0_v1/dev_step1_2/off/out/3D000000002.plt",
+  "right": "/home/jzh/whileLBM_dualresidual_v1/evidence/stage0_v1/dev_step1_2/shadow/out/3D000000002.plt",
+  "worst_max_abs": 2.3283064365386963e-10,
+  "worst_rel_l2": 8.688974497429493e-12
+}

@@ -1,5 +1,9 @@
 __pycache__/
 lbm_gpu
 lbm_compare
+tbook_stage_audit
+fixed_point_state_audit
+real_state_cross_audit
+oracle_pressure_routes
 *.o
 pinn_restart_assets/legacy_archive/

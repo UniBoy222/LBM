@@ -1,0 +1,12 @@
+state=/home/jzh/whileLBM_dualresidual_v1/evidence/stage0_v1/final_validation/dev_step1_2/run_final/states/fixed_state_step0002_iter00010300.bin
+step=2
+iteration=10300
+collision_max_abs=6.93889390390722838e-18
+stream_max_abs=6.93889390390722838e-18
+boundary_max_abs=6.93889390390722838e-18
+pressure_image_max_abs=5.55111512312578270e-17
+r_h_max_abs=6.93889390390722838e-18
+r_p_max_abs=0.00000000000000000e+00
+worst_max_abs=5.55111512312578270e-17
+tolerance=1.00000000000000000e-12
+pass=1

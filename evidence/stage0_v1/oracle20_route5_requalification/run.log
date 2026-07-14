@@ -1,0 +1,44 @@
+从文件读取Inamuro参数: oracle/development_20.in
+Inamuro参数读取成功!
+从文件读取所有参数: oracle/development_20.in
+从文件读取网格尺寸: 48x96x128
+
+=== Inamuro 物理参数 ===
+流体物性:
+  密度: rho_L=50, rho_G=1
+  粘度: mu_L=0.008, mu_G=0.00016
+LBM参数:
+  松弛: tauf=1, taug=1
+  运动粘性: gam_l=0.166667, gam_g=0.166667 (由松弛时间计算)
+相场参数:
+  相场值: fei_L=0.092, fei_G=0.015
+  边界值: fei_max=0.09714, fei_min=0.01134
+  表面张力系数: k_f=0.5, k_g=0.0005
+物理几何:
+  液滴直径: DD=32
+初始条件:
+  init_mode=two_droplets, init_profile=sharp, init_velocity=0.035, interface_width=2, init_center=(-1, -1, -1), init_separation=-1, init_offset_x=0
+状态方程:
+  EOS参数: T=0.035, a=1, b=6.7
+========================
+Inamuro算法核心初始化完成（全部从文件）: 48x96x128
+route=5 step=1 iterations=0 residual=0 e2e_ms=13.2385 max_field_rel=0 bitwise=1
+route=5 step=2 iterations=0 residual=0 e2e_ms=10.0024 max_field_rel=0 bitwise=1
+route=5 step=3 iterations=0 residual=0 e2e_ms=9.95339 max_field_rel=0 bitwise=1
+route=5 step=4 iterations=0 residual=0 e2e_ms=10.3248 max_field_rel=0 bitwise=1
+route=5 step=5 iterations=0 residual=0 e2e_ms=10.6362 max_field_rel=0 bitwise=1
+route=5 step=6 iterations=0 residual=0 e2e_ms=10.4003 max_field_rel=0 bitwise=1
+route=5 step=7 iterations=0 residual=0 e2e_ms=9.99381 max_field_rel=0 bitwise=1
+route=5 step=8 iterations=0 residual=0 e2e_ms=11.0026 max_field_rel=0 bitwise=1
+route=5 step=9 iterations=0 residual=0 e2e_ms=10.4948 max_field_rel=0 bitwise=1
+route=5 step=10 iterations=0 residual=0 e2e_ms=10.38 max_field_rel=0 bitwise=1
+route=5 step=11 iterations=0 residual=0 e2e_ms=10.3192 max_field_rel=0 bitwise=1
+route=5 step=12 iterations=0 residual=0 e2e_ms=10.1702 max_field_rel=0 bitwise=1
+route=5 step=13 iterations=0 residual=0 e2e_ms=10.7288 max_field_rel=0 bitwise=1
+route=5 step=14 iterations=0 residual=0 e2e_ms=10.4378 max_field_rel=0 bitwise=1
+route=5 step=15 iterations=0 residual=0 e2e_ms=10.3848 max_field_rel=0 bitwise=1
+route=5 step=16 iterations=0 residual=0 e2e_ms=10.4758 max_field_rel=0 bitwise=1
+route=5 step=17 iterations=0 residual=0 e2e_ms=10.713 max_field_rel=0 bitwise=1
+route=5 step=18 iterations=0 residual=0 e2e_ms=10.3909 max_field_rel=0 bitwise=1
+route=5 step=19 iterations=0 residual=0 e2e_ms=10.9901 max_field_rel=0 bitwise=1
+route=5 step=20 iterations=0 residual=0 e2e_ms=10.5014 max_field_rel=0 bitwise=1

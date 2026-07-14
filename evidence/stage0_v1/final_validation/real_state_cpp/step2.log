@@ -1,0 +1,12 @@
+step=2
+iteration=10300
+cells=589824
+collision_max_abs=2.77555756156289135e-17
+stream_max_abs=2.77555756156289135e-17
+boundary_max_abs=2.77555756156289135e-17
+live_pressure_max_abs=0.00000000000000000e+00
+image_pressure_max_abs=3.33066907387546962e-16
+fixed_point_terms_relative_max_abs=1.44540111374253480e-13
+gauge_map_max_abs=1.11022302462515654e-16
+nonfinite_values=0
+pass=1

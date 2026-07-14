@@ -40,11 +40,26 @@ public:
         double relative_error = 0.0;
         double pressure_l1_delta = 0.0;
         double pressure_l1_norm = 0.0;
+        double fixed_point_h_l1 = 0.0;
+        double fixed_point_h_scale = 0.0;
+        double fixed_point_h_relative = 0.0;
+        double fixed_point_p_l1 = 0.0;
+        double fixed_point_p_scale = 0.0;
+        double fixed_point_p_relative = 0.0;
+        double fixed_point_relative = 0.0;
+        std::uint64_t shadow_active_h_values_checked = 0;
+        std::uint64_t shadow_active_h_mismatches = 0;
+        std::uint64_t shadow_active_p_values_checked = 0;
+        std::uint64_t shadow_active_p_mismatches = 0;
         double source_mean = 0.0;
         double source_abs_mean = 0.0;
         double projected_source_mean = 0.0;
         double pressure_gauge_target = 0.0;
         double pressure_gauge_max_shift = 0.0;
+        bool fixed_point_evaluated = false;
+        bool pressure_converged = false;
+        bool fixed_point_converged = false;
+        bool dual_residual_enabled = false;
         bool converged = false;
         int fallback_count = 0;
     };
@@ -63,6 +78,28 @@ public:
         double gauge_gradient_max_abs = 0.0;
         double gauge_correct_uvw_max_abs = 0.0;
         double gauge_p_sum_h_max_abs = 0.0;
+        double fixed_point_terms_max_abs = 0.0;
+        double fixed_point_map_gauge_max_abs = 0.0;
+        double fixed_point_gauge_max_abs = 0.0;
+        double fixed_point_repeat_max_abs = 0.0;
+        double fixed_point_h_relative = 0.0;
+        double fixed_point_p_relative = 0.0;
+        double fixed_point_relative = 0.0;
+    };
+
+    struct FixedPointStateAuditResult
+    {
+        std::uint32_t step = 0;
+        std::uint64_t iteration = 0;
+        std::uint64_t cells = 0;
+        double collision_max_abs = 0.0;
+        double stream_max_abs = 0.0;
+        double boundary_max_abs = 0.0;
+        double live_pressure_max_abs = 0.0;
+        double image_pressure_max_abs = 0.0;
+        double fixed_point_terms_relative_max_abs = 0.0;
+        double gauge_map_max_abs = 0.0;
+        std::uint64_t nonfinite_values = 0;
     };
 
     // 从已经初始化好的 CPU Inamuro 构造（推荐做法）
@@ -89,6 +126,7 @@ public:
     POnlyInjectionAuditResult auditPOnlyInjection();
     const PoissonStepDiagnostics& getLastPoissonDiagnostics() const;
     static TBookStageAuditResult runTBookStageAudit(const std::string& dump_path);
+    static FixedPointStateAuditResult runFixedPointStateAudit(const std::string& state_path);
 
     // 性能与roofline证据输出
     void setUseFusedPoisson(bool enabled);
@@ -106,10 +144,15 @@ public:
     void setUseFusedBoundaryPressure(bool enabled);
     void setUsePoissonGraph(bool enabled);
     void setEnablePoissonDetailTiming(bool enabled);
+    void setUsePoissonDeterministicReductions(bool enabled);
+    void setEnablePoissonShadowStateAudit(bool enabled);
+    void setEnablePoissonFixedPointShadow(bool enabled);
+    void setUsePoissonDualResidual(bool enabled);
     void setPoissonConvergence(int check_interval, double tolerance);
     void setPoissonIterationLimit(std::uint64_t max_iterations);
     void setPoissonDiagnosticsPath(const std::string& path);
     void setPoissonFeatureDumpDirectory(const std::string& path);
+    void setPoissonFixedPointDumpDirectory(const std::string& path);
     void setUsePoissonSpatialDiagnostics(bool enabled);
     void printPerformanceMetrics() const;
     void printRooflineSummary() const;
@@ -168,6 +211,10 @@ private:
     bool use_poisson_spatial_diagnostics = false;
     bool use_poisson_two_grid_correction = false;
     bool enable_poisson_detail_timing = false;
+    bool use_poisson_deterministic_reductions = false;
+    bool enable_poisson_shadow_state_audit = false;
+    bool enable_poisson_fixed_point_shadow = false;
+    bool use_poisson_dual_residual = false;
     int poisson_check_interval = 100;
     double poisson_tolerance = 0.001;
     std::uint64_t poisson_iteration_limit = 0;
@@ -179,6 +226,7 @@ private:
     double poisson_two_grid_strength = 0.5;
     std::string poisson_diagnostics_path;
     std::string poisson_feature_dump_directory;
+    std::string poisson_fixed_point_dump_directory;
     OracleRoute oracle_route = OracleRoute::Baseline;
     bool oracle_pressure_ready = false;
     PoissonStepDiagnostics last_poisson_diagnostics;
@@ -191,6 +239,7 @@ private:
     void buildPoissonGraphSegment();
     void writePoissonDiagnostic(int step, std::uint64_t iteration, double pressure_l1_delta,
                                 double pressure_l1_norm, double relative_error,
+                                bool pressure_converged, bool fixed_point_converged,
                                 bool converged, double block_low_frequency_fraction,
                                 int block_size, int block_count) const;
 
@@ -231,6 +280,7 @@ private:
         double* d_anderson_stats = nullptr;
         double* d_pressure_block_sums = nullptr;
         double* d_pressure_block_error = nullptr;
+        double* d_fixed_point_block_sums = nullptr;
         double* d_oracle_pressure = nullptr;
         double* d_source_stats = nullptr;
         float* d_poisson_features = nullptr;
@@ -240,6 +290,7 @@ private:
     void allocateDeviceMemory();
     void freeDeviceMemory();
     void dumpPoissonEntryFeatures(std::uint32_t step);
+    void dumpFixedPointState(std::uint32_t step, std::uint64_t iteration);
 
     // 从 CPU 端“扁平化”并上传到 GPU（需要 Inamuro 声明 friend class InamuroCUDA）
     void initFromCPU();

@@ -1,0 +1,87 @@
+{
+  "schema": "whilelbm-dual-residual-stage0-v1",
+  "verdict": "Go",
+  "verdict_scope": "strict unbounded GPU split+split dual-residual baseline and audit instrumentation",
+  "workspace": "/home/jzh/whileLBM_dualresidual_v1",
+  "original_workspace_modified": false,
+  "training_performed": false,
+  "maximum_run_steps": 20,
+  "production_contract": {
+    "poisson_iteration_limit": 0,
+    "check_interval": 100,
+    "tolerance": 0.001,
+    "exit": "pressure_relative_change < 1e-3 AND kinetic_fixed_point_relative < 1e-3",
+    "map": "collision -> periodic pull stream -> x-slip -> p=sum(h_i)",
+    "deterministic_reductions": "256-thread fixed block tree plus increasing-block-order host Kahan"
+  },
+  "synthetic_tbook": {
+    "cpp_pass": true,
+    "cpp_fixed_point_terms_max_abs": 1.2434497875801753e-14,
+    "torch_pass": true,
+    "torch_worst_max_abs": 3.3306690738754696e-16,
+    "tolerance": 1e-12
+  },
+  "real_float64_development_step1_2": {
+    "cpp_pass": true,
+    "cpp_worst_elementwise_max_abs": 3.3306690738754696e-16,
+    "cpp_worst_fixed_point_terms_relative_abs": 1.4454011137425348e-13,
+    "torch_pass": true,
+    "torch_worst_gated_numerical_error": 6.661338147750939e-16,
+    "cpp_torch_direct_cross_pass": true,
+    "cpp_torch_direct_cross_worst_max_abs": 5.551115123125783e-17,
+    "pressure_gradient_finite_nonzero": true,
+    "gauge_pass": true,
+    "nonfinite_values": 0,
+    "step1": {
+      "iterations": 6600,
+      "pressure_relative": 0.0009391749135395442,
+      "fixed_point_relative": 9.100951970846793e-06,
+      "active_h_values_checked": 583925760,
+      "active_h_mismatches": 0,
+      "active_p_values_checked": 38928384,
+      "active_p_mismatches": 0
+    },
+    "step2": {
+      "iterations": 10300,
+      "pressure_relative": 0.0009618957160564468,
+      "fixed_point_relative": 1.0030344876354873e-05,
+      "active_h_values_checked": 911278080,
+      "active_h_mismatches": 0,
+      "active_p_values_checked": 60751872,
+      "active_p_mismatches": 0
+    },
+    "repeat_diagnostics_bitwise_equal": true
+  },
+  "dual20": {
+    "passed_steps": 20,
+    "total_steps": 20,
+    "total_iterations": 130600,
+    "min_step_iterations": 2400,
+    "max_step_iterations": 11000,
+    "max_pressure_relative": 0.0009993306985712912,
+    "max_fixed_point_relative": 1.072553628862776e-05,
+    "fallbacks": 0,
+    "nonfinite_values": 0,
+    "diagnostics_repeat_bitwise_equal": true
+  },
+  "route5_oracle_requalification": {
+    "passed_steps": 20,
+    "total_steps": 20,
+    "poisson_iterations": 0,
+    "max_field_relative_error": 0.0,
+    "bitwise_equal_steps": 20,
+    "claim_boundary": "bypass equivalence only; not dual-residual Poisson convergence"
+  },
+  "optional_memcheck": {
+    "status": "unavailable",
+    "reason": "WSL/WDDM debugger interface and device not supported",
+    "counted_as_gate": false,
+    "audited_executable_passed": true
+  },
+  "not_proved": [
+    "p+hneq tail-state capture or warm-start injection",
+    "first-check 100-iteration warm-start exit",
+    "warm-start speedup",
+    "learnability or generalization"
+  ]
+}

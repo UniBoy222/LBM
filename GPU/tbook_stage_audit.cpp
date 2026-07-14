@@ -1,5 +1,6 @@
 #include "InamuroCUDA.hpp"
 
+#include <cmath>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
@@ -25,6 +26,13 @@ int main(int argc, char** argv)
                   << "gauge_gradient_max_abs=" << result.gauge_gradient_max_abs << '\n'
                   << "gauge_correct_uvw_max_abs=" << result.gauge_correct_uvw_max_abs << '\n'
                   << "gauge_p_sum_h_max_abs=" << result.gauge_p_sum_h_max_abs << '\n'
+                  << "fixed_point_terms_max_abs=" << result.fixed_point_terms_max_abs << '\n'
+                  << "fixed_point_map_gauge_max_abs=" << result.fixed_point_map_gauge_max_abs << '\n'
+                  << "fixed_point_gauge_max_abs=" << result.fixed_point_gauge_max_abs << '\n'
+                  << "fixed_point_repeat_max_abs=" << result.fixed_point_repeat_max_abs << '\n'
+                  << "fixed_point_h_relative=" << result.fixed_point_h_relative << '\n'
+                  << "fixed_point_p_relative=" << result.fixed_point_p_relative << '\n'
+                  << "fixed_point_relative=" << result.fixed_point_relative << '\n'
                   << "dump=" << dump_path << '\n';
         const double tolerance = 1.0e-12;
         const bool pass = result.collision_max_abs <= tolerance &&
@@ -38,7 +46,12 @@ int main(int argc, char** argv)
                           result.source_projection_gradient_max_abs <= tolerance &&
                           result.gauge_gradient_max_abs <= tolerance &&
                           result.gauge_correct_uvw_max_abs <= tolerance &&
-                          result.gauge_p_sum_h_max_abs <= tolerance;
+                          result.gauge_p_sum_h_max_abs <= tolerance &&
+                          result.fixed_point_terms_max_abs <= tolerance &&
+                          result.fixed_point_map_gauge_max_abs <= tolerance &&
+                          result.fixed_point_gauge_max_abs <= tolerance &&
+                          result.fixed_point_repeat_max_abs <= tolerance &&
+                          std::isfinite(result.fixed_point_relative);
         return pass ? 0 : 2;
     } catch (const std::exception& e) {
         std::cerr << "T_book stage audit failed: " << e.what() << '\n';

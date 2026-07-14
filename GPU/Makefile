@@ -12,10 +12,11 @@ CPP_SRC := Inamuro.cpp InamuroSolver.cpp common.cpp
 TARGET_GPU := lbm_gpu
 TARGET_COMPARE := lbm_compare
 TARGET_TBOOK := tbook_stage_audit
+TARGET_STATE_AUDIT := fixed_point_state_audit
 TARGET_ORACLE := oracle_pressure_routes
 PARAMS_SMALL := params_small.in
 
-.PHONY: all gpu compare tbook-audit oracle test test-onepass run clean help
+.PHONY: all gpu compare tbook-audit state-audit oracle test test-onepass run clean help
 
 all: gpu compare
 
@@ -24,6 +25,8 @@ gpu: $(TARGET_GPU)
 compare: $(TARGET_COMPARE)
 
 tbook-audit: $(TARGET_TBOOK)
+
+state-audit: $(TARGET_STATE_AUDIT)
 
 oracle: $(TARGET_ORACLE)
 
@@ -35,6 +38,9 @@ $(TARGET_COMPARE): $(GPU_SRC) $(CPP_SRC) compare_test.cpp
 
 $(TARGET_TBOOK): $(GPU_SRC) $(CPP_SRC) tbook_stage_audit.cpp
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $(GPU_SRC) $(CPP_SRC) tbook_stage_audit.cpp -o $@
+
+$(TARGET_STATE_AUDIT): $(GPU_SRC) $(CPP_SRC) fixed_point_state_audit.cpp
+	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $(GPU_SRC) $(CPP_SRC) fixed_point_state_audit.cpp -o $@
 
 $(TARGET_ORACLE): $(GPU_SRC) $(CPP_SRC) oracle_pressure_routes.cpp
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) $(GPU_SRC) $(CPP_SRC) oracle_pressure_routes.cpp -o $@
@@ -49,13 +55,14 @@ run: $(TARGET_GPU)
 	./$(TARGET_GPU) --mode gpu --params $(PARAMS_SMALL) --steps 20 --poisson onepass --pressure-boundary fused --no-roofline
 
 clean:
-	rm -rf $(TARGET_GPU) $(TARGET_COMPARE) $(TARGET_TBOOK) $(TARGET_ORACLE) *.o __pycache__
+	rm -rf $(TARGET_GPU) $(TARGET_COMPARE) $(TARGET_TBOOK) $(TARGET_STATE_AUDIT) $(TARGET_ORACLE) *.o __pycache__
 
 help:
 	@echo "Targets:"
 	@echo "  make gpu          Build GPU runner"
 	@echo "  make compare      Build CPU/GPU comparison gate"
 	@echo "  make tbook-audit  Build staged Eq.(6.42)-(6.44) audit"
+	@echo "  make state-audit  Build real-state fixed-point audit"
 	@echo "  make oracle       Build strict 5/3/1 Oracle runner"
 	@echo "  make test         Run 1-step split CPU/GPU gate"
 	@echo "  make test-onepass Run 1-step onepass CPU/GPU gate"

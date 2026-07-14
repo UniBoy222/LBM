@@ -39,7 +39,12 @@ struct RunConfig {
     bool print_roofline = true;
     bool poisson_detail = false;
     bool poisson_graph = false;
+    bool poisson_deterministic_reductions = false;
+    bool poisson_shadow_state_audit = false;
+    bool poisson_fixed_point_shadow = false;
+    bool poisson_dual_residual = false;
     std::string poisson_diagnostics;
+    std::string poisson_fixed_point_dump_dir;
     bool poisson_spatial_diagnostics = false;
 };
 
@@ -57,6 +62,9 @@ void print_usage(const char* argv0)
         << "       [--poisson-two-grid-correction] [--poisson-two-grid-strength X]\n"
         << "       [--output-frequency N] [--output-steps A,B,C]\n"
         << "       [--poisson-graph] [--poisson-detail] [--poisson-diagnostics CSV]\n"
+        << "       [--poisson-deterministic-reductions]\n"
+        << "       [--poisson-shadow-state-audit] [--poisson-fixed-point-dump-dir DIR]\n"
+        << "       [--poisson-fixed-point-shadow] [--poisson-dual-residual]\n"
         << "       [--poisson-spatial-diagnostics]\n"
         << "       [--write-output] [--no-roofline]\n";
 }
@@ -175,8 +183,20 @@ RunConfig parse_args(int argc, char** argv)
             cfg.poisson_detail = true;
         } else if (arg == "--poisson-graph") {
             cfg.poisson_graph = true;
+        } else if (arg == "--poisson-deterministic-reductions") {
+            cfg.poisson_deterministic_reductions = true;
+        } else if (arg == "--poisson-shadow-state-audit") {
+            cfg.poisson_shadow_state_audit = true;
+        } else if (arg == "--poisson-fixed-point-shadow") {
+            cfg.poisson_fixed_point_shadow = true;
+        } else if (arg == "--poisson-dual-residual") {
+            cfg.poisson_dual_residual = true;
+            cfg.poisson_fixed_point_shadow = true;
+            cfg.poisson_deterministic_reductions = true;
         } else if (arg == "--poisson-diagnostics") {
             cfg.poisson_diagnostics = require_value(arg);
+        } else if (arg == "--poisson-fixed-point-dump-dir") {
+            cfg.poisson_fixed_point_dump_dir = require_value(arg);
         } else if (arg == "--poisson-spatial-diagnostics") {
             cfg.poisson_spatial_diagnostics = true;
         } else if (arg == "--no-roofline") {
@@ -214,6 +234,25 @@ RunConfig parse_args(int argc, char** argv)
     if (!(cfg.poisson_two_grid_strength >= 0.0)) {
         throw std::runtime_error("--poisson-two-grid-strength must be non-negative");
     }
+    if (cfg.poisson_fixed_point_shadow &&
+        (cfg.mode != "gpu" || cfg.poisson != "split" ||
+         cfg.pressure_boundary != "split" || cfg.source_aware_hh_init ||
+         cfg.poisson_graph || cfg.poisson_anderson_m1 ||
+         cfg.poisson_two_grid_correction || cfg.pressure_relax_scale != 1.0 ||
+         cfg.poisson_fixed_point_relax != 1.0)) {
+        throw std::runtime_error(
+            "fixed-point residual requires GPU split+split, unit relaxation, "
+            "and source-aware/graph/Anderson/two-grid disabled");
+    }
+    if (cfg.poisson_dual_residual &&
+        (cfg.poisson_check_interval != 100 || cfg.poisson_tolerance != 1.0e-3 ||
+         cfg.poisson_iteration_limit != 0 || cfg.poisson_spatial_diagnostics ||
+         !cfg.poisson_deterministic_reductions)) {
+        throw std::runtime_error(
+            "dual-residual exit requires check_interval=100, tolerance=1e-3, "
+            "poisson_iteration_limit=0, deterministic reductions, and no "
+            "spatial diagnostics");
+    }
 
     load_run_config_from_params(cfg.params, cfg, steps_set, output_frequency_set);
     if (cfg.steps < 0) {
@@ -221,6 +260,12 @@ RunConfig parse_args(int argc, char** argv)
     }
     if (cfg.output_frequency <= 0) {
         cfg.output_frequency = 100;
+    }
+    if ((cfg.poisson_shadow_state_audit ||
+         !cfg.poisson_fixed_point_dump_dir.empty()) &&
+        (!cfg.poisson_dual_residual || cfg.steps < 1 || cfg.steps > 2)) {
+        throw std::runtime_error(
+            "fixed-point state evidence requires dual residual and 1-2 steps");
     }
     return cfg;
 }
@@ -264,12 +309,20 @@ int main(int argc, char** argv)
                   << (cfg.poisson_iteration_limit == 0 ? " (unbounded)" : "")
                   << " poisson_graph=" << (cfg.poisson_graph ? "yes" : "no")
                   << " poisson_detail=" << (cfg.poisson_detail ? "yes" : "no")
+                  << " poisson_deterministic_reductions="
+                  << (cfg.poisson_deterministic_reductions ? "yes" : "no")
+                  << " poisson_shadow_state_audit="
+                  << (cfg.poisson_shadow_state_audit ? "yes" : "no")
+                  << " poisson_fixed_point_shadow=" << (cfg.poisson_fixed_point_shadow ? "yes" : "no")
+                  << " poisson_dual_residual=" << (cfg.poisson_dual_residual ? "yes" : "no")
                   << " poisson_fixed_point_relax=" << cfg.poisson_fixed_point_relax
                   << " poisson_anderson_m1=" << (cfg.poisson_anderson_m1 ? "yes" : "no")
                   << " poisson_anderson_beta_max=" << cfg.poisson_anderson_beta_max
                   << " poisson_two_grid_correction=" << (cfg.poisson_two_grid_correction ? "yes" : "no")
                   << " poisson_two_grid_strength=" << cfg.poisson_two_grid_strength
                   << " poisson_diagnostics=" << (cfg.poisson_diagnostics.empty() ? "none" : cfg.poisson_diagnostics)
+                  << " poisson_fixed_point_dump_dir="
+                  << (cfg.poisson_fixed_point_dump_dir.empty() ? "none" : cfg.poisson_fixed_point_dump_dir)
                   << " poisson_spatial_diagnostics=" << (cfg.poisson_spatial_diagnostics ? "yes" : "no")
                   << " params=" << cfg.params
                   << " steps=" << cfg.steps
@@ -308,9 +361,14 @@ int main(int argc, char** argv)
         gpu.setUseFusedBoundaryPressure(cfg.pressure_boundary == "fused");
         gpu.setUsePoissonGraph(cfg.poisson_graph);
         gpu.setEnablePoissonDetailTiming(cfg.poisson_detail);
+        gpu.setUsePoissonDeterministicReductions(cfg.poisson_deterministic_reductions);
+        gpu.setEnablePoissonShadowStateAudit(cfg.poisson_shadow_state_audit);
+        gpu.setEnablePoissonFixedPointShadow(cfg.poisson_fixed_point_shadow);
+        gpu.setUsePoissonDualResidual(cfg.poisson_dual_residual);
         gpu.setPoissonConvergence(cfg.poisson_check_interval, cfg.poisson_tolerance);
         gpu.setPoissonIterationLimit(cfg.poisson_iteration_limit);
         gpu.setPoissonDiagnosticsPath(cfg.poisson_diagnostics);
+        gpu.setPoissonFixedPointDumpDirectory(cfg.poisson_fixed_point_dump_dir);
         gpu.setUsePoissonSpatialDiagnostics(cfg.poisson_spatial_diagnostics);
         const double ms = run_loop(solver, cfg, [&](bool need_output) {
             gpu.performTimeStepGPU();

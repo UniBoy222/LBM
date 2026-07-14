@@ -1,0 +1,9 @@
+GPU/lbm_gpu
+GPU/tbook_stage_audit
+GPU/fixed_point_state_audit
+GPU/real_state_cross_audit
+GPU/oracle_pressure_routes
+__pycache__/
+*.pyc
+evidence/**/*.plt
+evidence/**/*.bin

@@ -1,0 +1,31 @@
+{
+  "schema": "cpp-torch-real-state-cross-audit-v1",
+  "tolerance": 1e-12,
+  "pass": true,
+  "stage_payloads_retained": false,
+  "stage_payloads_reproducible_from": [
+    "oracle/dump_fixed_point_torch_cpu_stages.py",
+    "GPU/real_state_cross_audit.cpp",
+    "final_validation/dev_step1_2/run_final/states"
+  ],
+  "step1": {
+    "iteration": 6600,
+    "state_sha256": "bb5953f200fbaaf00f63acfad9f2fd84d2a94ab3193573e8c59b0acfcfee3b21",
+    "worst_component_max_abs": 5.421010862427522e-20,
+    "pass": true
+  },
+  "step2": {
+    "iteration": 10300,
+    "state_sha256": "90f15d4ec416d405231a70099f08c7ff47615f19f6868057f679ca0b8d4a1502",
+    "worst_component_max_abs": 5.551115123125783e-17,
+    "pass": true
+  },
+  "components": [
+    "collision",
+    "stream",
+    "boundary",
+    "pressure_image",
+    "R_h",
+    "R_p"
+  ]
+}

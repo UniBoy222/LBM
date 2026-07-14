@@ -1,0 +1,58 @@
+LBM runner mode=gpu poisson=split pressure_boundary=split poisson_check_interval=100 poisson_tolerance=0.001 poisson_iteration_limit=0 (unbounded) poisson_graph=no poisson_detail=no poisson_fixed_point_shadow=yes poisson_dual_residual=yes poisson_fixed_point_relax=1 poisson_anderson_m1=no poisson_anderson_beta_max=1 poisson_two_grid_correction=no poisson_two_grid_strength=0.5 poisson_diagnostics=evidence/stage0_v1/dual20/diagnostics.csv poisson_spatial_diagnostics=no params=oracle/development_20.in steps=20 output_steps=0 write_output=no
+从文件读取Inamuro参数: oracle/development_20.in
+Inamuro参数读取成功!
+从文件读取所有参数: oracle/development_20.in
+从文件读取网格尺寸: 48x96x128
+
+=== Inamuro 物理参数 ===
+流体物性:
+  密度: rho_L=50, rho_G=1
+  粘度: mu_L=0.008, mu_G=0.00016
+LBM参数:
+  松弛: tauf=1, taug=1
+  运动粘性: gam_l=0.166667, gam_g=0.166667 (由松弛时间计算)
+相场参数:
+  相场值: fei_L=0.092, fei_G=0.015
+  边界值: fei_max=0.09714, fei_min=0.01134
+  表面张力系数: k_f=0.5, k_g=0.0005
+物理几何:
+  液滴直径: DD=32
+初始条件:
+  init_mode=two_droplets, init_profile=sharp, init_velocity=0.035, interface_width=2, init_center=(-1, -1, -1), init_separation=-1, init_offset_x=0
+状态方程:
+  EOS参数: T=0.035, a=1, b=6.7
+========================
+Inamuro算法核心初始化完成（全部从文件）: 48x96x128
+GPU wall_total_ms=154402.177 wall_avg_ms_per_step=7720.109 wall_MLUPS=0.076
+
+========== GPU Performance Metrics ==========
+Total time steps: 20
+Poisson mode: split
+Boundary-pressure mode: split
+Poisson graph: disabled
+Poisson convergence: check_interval=100, tolerance=0.001
+Kinetic fixed-point shadow: enabled, dual-residual exit=enabled
+poisson_iteration_limit=0 (unbounded)
+Source-aware hh init: disabled, scale=1.000
+Pressure relaxation scale: 1.000
+Poisson fixed-point relaxation: 1.000
+Poisson Anderson m1: disabled, beta_max=1.000
+Poisson spatial diagnostics: disabled
+Poisson two-grid correction: disabled, strength=0.500
+
+Average time per kernel (ms):
+  Collision:      2.913
+  Stream:         0.625
+  Macro:          0.250
+  Poisson:        7048.299
+  Poisson iters:  6530.000
+  Total per step: 7052.086
+  MLUPS:          0.084
+
+Kernel time distribution:
+  Collision:      0.041%
+  Stream:         0.009%
+  Macro:          0.004%
+  Poisson:        99.946%
+=============================================
+
