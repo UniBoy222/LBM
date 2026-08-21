@@ -2,6 +2,7 @@
 
 #include "LBMBase.hpp"
 #include "common.hpp"
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -65,6 +66,15 @@ protected:
     };
     Parameters params;
 
+    // Per-instance solver state. These must not be function statics because
+    // CPU/GPU comparison tests construct more than one solver in one process.
+    bool is_first_step = true;
+    Vector4D stream_temp;
+    Vector3D pressure_prev;
+    int last_poisson_iterations = 0;
+    double last_poisson_residual = std::numeric_limits<double>::infinity();
+    std::vector<double> last_poisson_residual_trace;
+
 public:
     // === 构造函数重载 ===
     explicit Inamuro(int nx = 48, int ny = 96, int nz = 128); // 默认网格尺寸构造函数
@@ -82,6 +92,12 @@ public:
 
     // === 数据访问接口 ===
     void getGridSize(int& nx, int& ny, int& nz) const override;
+    int getLastPoissonIterations() const noexcept { return last_poisson_iterations; }
+    double getLastPoissonResidual() const noexcept { return last_poisson_residual; }
+    const std::vector<double>& getLastPoissonResidualTrace() const noexcept
+    {
+        return last_poisson_residual_trace;
+    }
 
 private:
     template <typename T>
@@ -116,7 +132,7 @@ private:
 
     // 压力泊松方程
     void solvePressurePoisson(); // 求解压力泊松方程
-    double getError(Vector3D& pressure_prev); // 获取压力误差
+    double getError(); // 获取压力误差
 
     void collision_p(); // 碰撞压力
     void getp(); // 获取压力

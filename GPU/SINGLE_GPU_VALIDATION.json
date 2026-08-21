@@ -1,0 +1,91 @@
+{
+  "receipt_version": 1,
+  "generated_at": "2026-08-21T19:16:00+08:00",
+  "scope": "legacy_1e-3_single_gpu_engineering_equivalence",
+  "base_commit": "1a6e3a9f24a5d9d04d7b2f3d077e412faae824f7",
+  "branch": "codex/pure-singlegpu-baseline",
+  "environment": {
+    "gpu": "NVIDIA GeForce RTX 5080",
+    "compute_capability": "12.0",
+    "driver": "596.49",
+    "cuda_compiler": "CUDA 12.8 V12.8.93"
+  },
+  "build": {
+    "command": "make NVCCFLAGS='-std=c++17 -O3 -lineinfo -arch=sm_120 -Xcompiler=-Wall,-Wextra' all",
+    "exit_code": 0,
+    "warnings": 0
+  },
+  "input_sha256": {
+    "GPU/Inamuro.cpp": "999e4c5ad65ed36df8175ba4468e6741bc366585419f63669bc4d125f0633412",
+    "GPU/Inamuro.hpp": "cbc7d3bcf86e23d80a68f44b5e2a8e1abe6b594c887223833437eaac116fa556",
+    "GPU/InamuroCUDA.cu": "6000d6961cc69b8f36f923a4c4c588d9547139e34662ce4f475ee3191bdbc77d",
+    "GPU/InamuroCUDA.hpp": "e1f6f019ea8a77bc3884dea0c15d7bc28883fa6cbe7d7395e945c36a96252404",
+    "GPU/common.cpp": "3cbe233311d9a7b88502962e1a08ebad321c45bfddc68baad241dcae612ab9cc",
+    "GPU/common.hpp": "4ec11aa04e85ef28dab87f07312cfc0017719c55a00aea6497f4691a7a34d614",
+    "GPU/LBMBase.hpp": "6c0c30d3864bba027170262dc8f82f46434758ca8395f5b7c9f616c4c6a365d5",
+    "GPU/main.cpp": "9b06b82b290646baecaecb0f72a3d9ffc847a682c988c82851f2a60ee7f3b9b2",
+    "GPU/compare_test.cpp": "72785aee45ece3fd6af28a2a40322cef10a81d6d91c309ac9857d853a9631983",
+    "GPU/Makefile": "380910ad1bebf9416a9f2b6cd1e27edfeb70df7ca8e221003b6459cbb98590f6",
+    "GPU/params.in": "2e74135249ddef4173ee94a75a69ccde0e1bd478520114da0ca8b8f76f08bb85",
+    "GPU/params_layout.in": "55d3b73405acc9c17bffc34e9af175167a52164b6f5fdb664e91b23a8ec45560",
+    "GPU/params_small.in": "27d4308afe8efa67992d3308beedda7aa4d14bdf36eab28079dc3efb7efdb5df"
+  },
+  "local_binary_sha256": {
+    "GPU/lbm_gpu": "488b977d9082245262c6e24919e3d031b2f2009862b2346f0d77f6674ab7b115",
+    "GPU/lbm_compare": "d5f3d587e01870bb21a3fc9975f058eabc60978de8379516e1fd0b891fa921d1"
+  },
+  "tests": [
+    {
+      "command": "make CUDA_ARCH=sm_120 test",
+      "exit_code": 0,
+      "summaries": [
+        "layout12x16x20: time0_equivalence=PASS, negative_finite_gate=PASS, equivalence=PASS, converged_steps=1/1, poisson_iterations=400",
+        "small16x32x32_step1: equivalence=PASS, converged_steps=1/1, poisson_iterations=800, worst_rel_l2=4.832238044171e-16",
+        "small16x32x32_step2: equivalence=PASS, converged_steps=1/2, cap_hits=1, worst_rel_l2=9.551053229694e-16",
+        "small16x32x32_step10: equivalence=PASS, converged_steps=1/10, cap_hits=9, worst_rel_l2=7.200362898809e-15, worst_max_abs=4.973799150321e-14"
+      ]
+    },
+    {
+      "command": "./lbm_compare --params params.in --steps 2",
+      "exit_code": 0,
+      "summary": "time0_equivalence=PASS, negative_finite_gate=PASS, equivalence=PASS, converged_steps=0/2, cap_hits=2, step_iterations=1000/1000, residuals=7.229901371566e-02/2.681096007432e-02, worst_field=hh0, worst_rel_l2=1.310519272287e-15, worst_max_abs=2.131628207280e-14, max_trace_diff=5.256906021600e-14"
+    },
+    {
+      "command": "five fresh invocations of ./lbm_compare --params params_small.in --steps 2",
+      "exit_code": 0,
+      "summary": "selected diagnostic output byte-identical across 5/5 runs"
+    },
+    {
+      "command": "./lbm_gpu --params params_small.in --steps 1",
+      "exit_code": 0,
+      "summary": "production CUDA entry used; poisson_iterations=800; residual=3.50983e-04; converged=yes"
+    },
+    {
+      "command": "lbm_gpu --params params_layout.in --steps 1 --output-every 1 in a fresh temporary directory",
+      "exit_code": 0,
+      "summary": "output directory created and Tecplot file written; size=138520 bytes"
+    },
+    {
+      "command": "./lbm_gpu --params /tmp/lbm-definitely-missing.in --steps 1",
+      "exit_code": 1,
+      "summary": "missing parameter file rejected"
+    },
+    {
+      "command": "make CUDA_ARCH=sm_120 memcheck",
+      "exit_code": 2,
+      "status": "UNAVAILABLE_NOT_PASS",
+      "summary": "compute-sanitizer reported WDDM debugger interface initialization failure and Device not supported; sanitizer PASS is not claimed"
+    }
+  ],
+  "purity_checks": {
+    "branch_reachable_history_has_neural_assets": false,
+    "working_tree_has_neural_code_or_assets": false,
+    "production_binary_has_test_finite_hook": false,
+    "production_binary_has_torch_dependency": false
+  },
+  "claim_boundary": [
+    "PASS proves legacy cap-1000 CPU/GPU engineering equivalence for the tested states.",
+    "It does not prove strict dual-residual Poisson convergence, fixed-point correctness, physical validity, E2E acceleration, or multi-GPU scalability.",
+    "The complete solver-step wall excludes construction, initial H2D, result download, and file output."
+  ]
+}

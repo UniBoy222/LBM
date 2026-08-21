@@ -1,6 +1,7 @@
 #pragma once
 #include "Inamuro.hpp"
 #include <cuda_runtime.h>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -15,22 +16,36 @@
 class InamuroCUDA
 {
 public:
+    struct PoissonDiagnostics {
+        int iterations = 0;
+        double relative_residual = std::numeric_limits<double>::infinity();
+        bool converged = false;
+        bool finite = false;
+        std::vector<double> residual_trace;
+    };
+
     // 从已经初始化好的 CPU Inamuro 构造（推荐做法）
     explicit InamuroCUDA(const Inamuro& cpuSolver);
 
-    // 禁止拷贝，允许移动（如需）
+    // 设备裸指针具有唯一所有权；禁止复制和默认移动，避免双重释放。
     InamuroCUDA(const InamuroCUDA&) = delete;
     InamuroCUDA& operator=(const InamuroCUDA&) = delete;
-    InamuroCUDA(InamuroCUDA&&) noexcept = default;
-    InamuroCUDA& operator=(InamuroCUDA&&) noexcept = default;
+    InamuroCUDA(InamuroCUDA&&) = delete;
+    InamuroCUDA& operator=(InamuroCUDA&&) = delete;
 
     ~InamuroCUDA();
 
-    // 单步时间推进（GPU 版本）——基线：宏观量 + 示例 streaming，其余留空壳供后续逐步替换
+    // 执行一个完整CUDA时间步。
     void performTimeStepGPU();
 
-    // 将 GPU 上的宏观量下载回 CPU Inamuro（用于输出/对比）
+    // 下载完整状态（ff/gg/hh及所有宏观量），用于输出和CPU/GPU资格验证。
     void downloadFieldsToCPU(Inamuro& cpuSolver) const;
+    const PoissonDiagnostics& getLastPoissonDiagnostics() const noexcept { return last_poisson; }
+    void printPerformanceMetrics() const;
+    void resetPerformanceMetrics();
+#ifdef LBM_TESTING
+    bool testFiniteGateRejectsNaN();
+#endif
 
 private:
     // ------------ 网格与布局 ------------
@@ -52,6 +67,10 @@ private:
     } params;
     
     bool is_first_step = true;   // 标记是否是第一个时间步（与CPU一致）
+    static constexpr int kPoissonMaxIterations = 1000;
+    static constexpr int kPoissonCheckInterval = 100;
+    static constexpr double kPoissonTolerance = 1.0e-3;
+    PoissonDiagnostics last_poisson;
     
     // ------------ 性能测量 ------------
     struct PerformanceMetrics {
@@ -59,6 +78,8 @@ private:
         double total_stream_time = 0.0;      // 迁移kernel总时间(ms)
         double total_macro_time = 0.0;       // 宏观量kernel总时间(ms)
         double total_poisson_time = 0.0;     // 压力泊松总时间(ms)
+        double total_step_wall_time = 0.0;   // 完整GPU求解步墙钟(ms)
+        long long total_poisson_iterations = 0;
         int time_step_count = 0;             // 时间步计数
     } perf;
     
@@ -72,6 +93,9 @@ private:
         double* d_ff = nullptr;
         double* d_gg = nullptr;
         double* d_hh = nullptr;
+        double* d_ff_tmp = nullptr;
+        double* d_gg_tmp = nullptr;
+        double* d_hh_tmp = nullptr;
 
         // 宏观量 [N_macro]（带 z 方向 ghost）
         double* d_rho = nullptr;
@@ -80,6 +104,9 @@ private:
         double* d_v   = nullptr;
         double* d_w   = nullptr;
         double* d_p   = nullptr;
+        double* d_p_prev = nullptr;
+        double* d_pressure_error = nullptr;
+        int* d_finite_flag = nullptr;
 
         // 梯度/拉普拉斯（仅物理域，后续逐步填充）
         double* d_fei_x = nullptr; double* d_fei_y = nullptr; double* d_fei_z = nullptr;
@@ -101,6 +128,9 @@ private:
 
     // 下载回 CPU（仅宏观量；若需要也可扩展下载分布函数做调试）
     void downloadMacroToCPU(Inamuro& cpuSolver) const;
+    void downloadDistributionsToCPU(Inamuro& cpuSolver) const;
+    double computePressureResidual();
+    bool validateFiniteState();
 
     // ------------ 单步子过程（与 CPU performTimeStep 对齐） ------------
     // 组合函数（实际实现）
@@ -113,21 +143,9 @@ private:
     void doPressurePoisson();          // 压力泊松求解（对应CPU的solvePressurePoisson）
     void doCorrectUVWAndHH();          // 速度修正+hh更新（对应CPU的correct_uvw+update_hh）
     
-    // 性能测量辅助函数
-    void printPerformanceMetrics() const;
-    void resetPerformanceMetrics();
-
     // ------------ 内联索引（cell-major / Q-minor） ------------
     static __host__ __device__ inline
-    int idx3D(int x, int y, int z, int lx, int ly, int lz_tot) {
-        // 注意：用于宏观量时 z 取 [0 .. lz_tot-1]，用于分布函数/梯度时 z 取物理域 [0 .. lz-1]
+    int idx3D(int x, int y, int z, int lx, int ly) {
         return (z * ly + y) * lx + x;
-    }
-
-    static __host__ __device__ inline
-    int idx4D(int q, int x, int y, int z, int lx, int ly, int lz) {
-        // z 为物理域索引
-        const int cell = (z * ly + y) * lx + x;
-        return cell * Q + q;  // 使用Q而非Q_
     }
 };

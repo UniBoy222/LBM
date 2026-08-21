@@ -31,3 +31,6 @@ Thumbs.db
 *.ptx
 *.cubin
 
+# 本地CUDA可执行文件
+GPU/lbm_gpu
+GPU/lbm_compare

@@ -1,10 +1,35 @@
 #include "Inamuro.hpp"
 #include <array>
+#include <climits>
 #include <cmath>
+#include <cstdint>
+#include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
+#include <stdexcept>
 #include <utility>
+
+namespace {
+
+void validateGridDimensions(int lx, int ly, int lz)
+{
+    if (lx < 3 || ly < 3 || lz < 3 || lz > INT_MAX - 2)
+        throw std::runtime_error("网格尺寸非法");
+    const std::uint64_t cells = static_cast<std::uint64_t>(lx) *
+                                static_cast<std::uint64_t>(ly) *
+                                static_cast<std::uint64_t>(lz);
+    const std::uint64_t macro_values = static_cast<std::uint64_t>(lx) *
+                                       static_cast<std::uint64_t>(ly) *
+                                       static_cast<std::uint64_t>(lz + 2);
+    if (cells == 0 || cells > static_cast<std::uint64_t>(INT_MAX / D3Q15::Q) ||
+        macro_values > static_cast<std::uint64_t>(INT_MAX))
+        throw std::runtime_error("网格超过当前int索引安全上限");
+}
+
+} // namespace
 
 // =========================================
 // === Inamuro::Parameters 类实现 ===
@@ -22,42 +47,42 @@ Inamuro::Parameters::Parameters(const std::string& filename)
 
     std::ifstream file(filename);
     if (!file.is_open())
-    {
-        std::cerr << "警告: 无法打开参数文件，使用默认参数" << std::endl;
-        update_gam();
-        return;
-    }
-    try
-    {
-        // 跳过求解器参数（前4行：网格尺寸、周期边界、时间步、输出频率）
-        int lx_file, ly_file, lz_file, t_max, Nwri;
-        file >> lx_file >> ly_file >> lz_file; // 第1行: 网格尺寸（跳过，不使用）
-        file >> period;                        // 第2行: 周期边界
-        file >> t_max;                         // 第3行: 最大时间步（跳过）
-        file >> Nwri;                          // 第4行: 输出频率（跳过）
+        throw std::runtime_error("无法打开参数文件: " + filename);
 
-        // 读取物理参数（从第5行开始）
-        file >> rho_L >> rho_G;     // 第5行: 密度
-        file >> tauf >> taug;       // 第6行: 松弛时间
-        file >> mu_L >> mu_G;       // 第7行: 粘度
-        file >> k_f >> k_g;         // 第8行: 系数
-        file >> T;                  // 第9行: 温度
-        file >> a;                  // 第10行: EOS参数a
-        file >> b;                  // 第11行: EOS参数b
-        file >> fei_max >> fei_min; // 第12行: 相场边界
-        file >> fei_L >> fei_G;     // 第13行: 相场值
-        file >> DD;                 // 第14行: 液滴直径
+    // 前4项是网格、周期、外层时间步和输出频率；随后是物理参数。
+    int lx_file = 0, ly_file = 0, lz_file = 0, t_max = 0, output_frequency = 0;
+    if (!(file >> lx_file >> ly_file >> lz_file
+              >> period >> t_max >> output_frequency
+              >> rho_L >> rho_G
+              >> tauf >> taug
+              >> mu_L >> mu_G
+              >> k_f >> k_g
+              >> T >> a >> b
+              >> fei_max >> fei_min
+              >> fei_L >> fei_G
+              >> DD))
+        throw std::runtime_error("参数文件不完整或格式错误: " + filename);
 
-        file.close();
-        std::cout << "Inamuro参数读取成功!" << std::endl;
-        update_gam();
-    }
-    catch (const std::exception& e)
-    {
-        std::cerr << "错误: Inamuro参数读取失败 - " << e.what() << std::endl;
-        file.close();
-        update_gam();
-    }
+    if (lx_file < 3 || ly_file < 3 || lz_file < 3 || t_max <= 0 || output_frequency <= 0)
+        throw std::runtime_error("参数文件中的网格或时间配置非法: " + filename);
+    const std::array<double, 16> scalars = {
+        rho_L, rho_G, tauf, taug, mu_L, mu_G, k_f, k_g,
+        T, a, b, fei_max, fei_min, fei_L, fei_G, DD};
+    for (double value : scalars)
+        if (!std::isfinite(value))
+            throw std::runtime_error("参数文件包含NaN/Inf: " + filename);
+    if (!(rho_L > 0.0 && rho_G > 0.0 && rho_L != rho_G &&
+          tauf > 0.0 && taug > 0.0 && mu_L >= 0.0 && mu_G >= 0.0 &&
+          fei_L != fei_G && DD > 0.0))
+        throw std::runtime_error("参数文件中的物理参数非法: " + filename);
+    if (std::abs(1.0 - b * fei_min) <= 1.0e-12 ||
+        std::abs(1.0 - b * fei_max) <= 1.0e-12 ||
+        std::abs(1.0 - b * fei_L) <= 1.0e-12 ||
+        std::abs(1.0 - b * fei_G) <= 1.0e-12)
+        throw std::runtime_error("参数使EOS分母在封存相场值处奇异: " + filename);
+
+    std::cout << "Inamuro参数读取成功!" << std::endl;
+    update_gam();
 }
 
 void Inamuro::Parameters::update_gam()
@@ -93,6 +118,7 @@ void Inamuro::Parameters::print() const
 
 Inamuro::Inamuro(int nx, int ny, int nz) : LBMBase(), lx(nx), ly(ny), lz(nz), params()
 {
+    validateGridDimensions(lx, ly, lz);
     initializeArrays();
     initializeDroplets();
     std::cout << "Inamuro算法核心初始化完成（默认参数）: " << lx << "x" << ly << "x" << lz << std::endl;
@@ -106,17 +132,16 @@ Inamuro::Inamuro(const std::string& filename) : LBMBase(), params(filename)
     std::ifstream file(filename);
     if (!file.is_open())
     {
-        std::cerr << "错误: 无法打开参数文件 " << filename << "，使用默认网格尺寸" << std::endl;
-        lx = 48;
-        ly = 96;
-        lz = 128;
+        throw std::runtime_error("无法打开参数文件: " + filename);
     }
     else
     {
-        file >> lx >> ly >> lz; // 读取第一行的网格尺寸
+        if (!(file >> lx >> ly >> lz) || lx < 3 || ly < 3 || lz < 3)
+            throw std::runtime_error("参数文件中的网格尺寸非法: " + filename);
         file.close();
         std::cout << "从文件读取网格尺寸: " << lx << "x" << ly << "x" << lz << std::endl;
     }
+    validateGridDimensions(lx, ly, lz);
 
     // 第二步：初始化数组
     initializeArrays();
@@ -143,7 +168,6 @@ void Inamuro::collision()
     secondord(w, w_lap);                // ∇²w
     secondord(fei, fei_lap);            // ∇²φ
 
-    static bool is_first_step = true;
     // ---- 主循环 ----
     for (int x = 0; x < lx; ++x)
     {
@@ -247,8 +271,7 @@ void Inamuro::collision()
 
 void Inamuro::stream(Vector4D& dist) // distribution 分布
 {
-    static Vector4D temp;
-    resize4D(temp, D3Q15::Q, lx, ly, lz, 0.0);
+    resize4D(stream_temp, D3Q15::Q, lx, ly, lz, 0.0);
 
     // 计算周期边界下的新坐标
     auto calc_new_coord = [](int current, int step, int max_size) -> int
@@ -262,7 +285,7 @@ void Inamuro::stream(Vector4D& dist) // distribution 分布
         int new_x = calc_new_coord(x, D3Q15::ex[dir], lx);
         int new_y = calc_new_coord(y, D3Q15::ey[dir], ly);
         int new_z = calc_new_coord(z, D3Q15::ez[dir], lz);
-        temp[dir][new_x][new_y][new_z] = dist[dir][x][y][z];
+        stream_temp[dir][new_x][new_y][new_z] = dist[dir][x][y][z];
     };
 
     // 迁移所有粒子
@@ -279,7 +302,7 @@ void Inamuro::stream(Vector4D& dist) // distribution 分布
             }
         }
     }
-    dist = std::move(temp); // 移动赋值
+    dist.swap(stream_temp);
 }
 
 void Inamuro::applyBoundaryConditions(Vector4D& dist)
@@ -360,6 +383,11 @@ void Inamuro::performTimeStep()
 
 void Inamuro::writeResults(int timeStep)
 {
+    std::error_code error;
+    std::filesystem::create_directories(output_config.output_dir, error);
+    if (error)
+        throw std::runtime_error("无法创建输出目录: " + output_config.output_dir);
+
     if (output_config.enable_tecplot)
     {
         writeTecplotBinary(timeStep);
@@ -424,6 +452,7 @@ void Inamuro::initializeArrays()
     resize3D(u_lap, lx, ly, lz);
     resize3D(v_lap, lx, ly, lz);
     resize3D(w_lap, lx, ly, lz);
+    resize3D(pressure_prev, lx, ly, lz, 0.0);
 }
 
 void Inamuro::initializeDroplets()
@@ -502,18 +531,10 @@ void Inamuro::slipBounceBack(Vector4D& dist)
 }
 void Inamuro::solvePressurePoisson()
 {
-    // 压力误差缓存（对应pp数组）
-    static Vector3D pressure_prev;
-    static bool first_call = true;
-
-    // 第一次调用时初始化压力缓存
-    if (first_call)
-    {
-        resize3D(pressure_prev, lx, ly, lz, 0.0);
-        first_call = false;
-    }
-
     // 压力泊松方程迭代求解
+    last_poisson_iterations = 1000;
+    last_poisson_residual = std::numeric_limits<double>::infinity();
+    last_poisson_residual_trace.clear();
     for (int i_iter = 1; i_iter <= 1000; ++i_iter)
     {
         // 压力修正（对应correction()）
@@ -529,7 +550,12 @@ void Inamuro::solvePressurePoisson()
         // 每100步检查收敛性
         if (i_iter % 100 == 0)
         {
-            double error = getError(pressure_prev);
+            double error = getError();
+            last_poisson_iterations = i_iter;
+            last_poisson_residual = error;
+            last_poisson_residual_trace.push_back(error);
+            if (!std::isfinite(error))
+                throw std::runtime_error("CPU Poisson残差出现NaN/Inf");
             if (error < 0.001)
             {
                 // 只在输出时间步显示收敛信息，避免过多输出
@@ -540,7 +566,7 @@ void Inamuro::solvePressurePoisson()
     }
 }
 
-double Inamuro::getError(Vector3D& pressure_prev)
+double Inamuro::getError()
 {
     double err1 = 0.0, err2 = 0.0;
 
@@ -562,7 +588,9 @@ double Inamuro::getError(Vector3D& pressure_prev)
         }
     }
 
-    return (err2 > 0.0) ? (err1 / err2) : 0.0;
+    if (err2 > 0.0)
+        return err1 / err2;
+    return (err1 == 0.0) ? 0.0 : std::numeric_limits<double>::infinity();
 }
 
 void Inamuro::collision_p()
@@ -683,10 +711,7 @@ void Inamuro::writeTecplotBinary(int timeStep)
 
     std::ofstream file(filename.str(), std::ios::binary);
     if (!file)
-    {
-        std::cerr << "无法打开文件: " << filename.str() << std::endl;
-        return;
-    }
+        throw std::runtime_error("无法打开文件: " + filename.str());
 
     // Tecplot二进制文件头常量
     constexpr float ZONEMARKER = 299.0f;
@@ -809,6 +834,8 @@ void Inamuro::writeTecplotBinary(int timeStep)
     }
 
     file.close();
+    if (!file)
+        throw std::runtime_error("写入Tecplot文件失败: " + filename.str());
     std::cout << "Tecplot文件已写入: " << filename.str() << std::endl;
 }
 
@@ -832,10 +859,7 @@ void Inamuro::writeDebugOutput(int timeStep)
 
     std::ofstream file(filename.str());
     if (!file)
-    {
-        std::cerr << "无法打开调试文件: " << filename.str() << std::endl;
-        return;
-    }
+        throw std::runtime_error("无法打开调试文件: " + filename.str());
 
     // 使用现代C++的流操作
     file << "x,y,z,u,v,w,rho,fei,p\n";
@@ -857,5 +881,7 @@ void Inamuro::writeDebugOutput(int timeStep)
     }
 
     file.close();
+    if (!file)
+        throw std::runtime_error("写入调试文件失败: " + filename.str());
     std::cout << "调试CSV文件已写入: " << filename.str() << std::endl;
 }

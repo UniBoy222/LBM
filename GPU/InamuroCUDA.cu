@@ -1,6 +1,12 @@
 #include "InamuroCUDA.hpp"
-#include <cmath>
 #include <algorithm>
+#include <chrono>
+#include <climits>
+#include <cstdint>
+#include <cmath>
+#include <iomanip>
+#include <limits>
+#include <vector>
 
 // 简单错误检查宏
 #ifndef CUDA_CHECK
@@ -12,6 +18,30 @@
     } \
 } while(0)
 #endif
+
+namespace {
+
+class ScopedCudaEvents {
+public:
+    cudaEvent_t start = nullptr;
+    cudaEvent_t stop = nullptr;
+
+    void create()
+    {
+        CUDA_CHECK(cudaEventCreate(&start));
+        CUDA_CHECK(cudaEventCreate(&stop));
+    }
+
+    ~ScopedCudaEvents()
+    {
+        if (start)
+            cudaEventDestroy(start);
+        if (stop)
+            cudaEventDestroy(stop);
+    }
+};
+
+} // namespace
 
 // -------------------- D3Q15 方向与权重（常量内存） --------------------
 // 与 CPU 版本 D3Q15 保持完全一致
@@ -633,6 +663,90 @@ __global__ void streamKernel(const double* __restrict__ f_post,
     }
 }
 
+// Deterministic block-wise L1 pressure residual. Each block writes its own
+// pair; the host combines pairs in ascending block order with Kahan summation.
+__global__ void pressureErrorKernel(
+    const double* __restrict__ p,
+    double* __restrict__ p_prev,
+    double* __restrict__ block_error,
+    int lx, int ly, int lz)
+{
+    extern __shared__ double scratch[];
+    double* s_delta = scratch;
+    double* s_norm = scratch + blockDim.x;
+
+    const int tid = threadIdx.x;
+    const int global = blockIdx.x * blockDim.x + tid;
+    const int n = lx * ly * lz;
+    double delta = 0.0;
+    double norm = 0.0;
+
+    if (global < n) {
+        const int x = global % lx;
+        const int y = (global / lx) % ly;
+        const int z = global / (lx * ly);
+        const int macro_idx = ((z + 1) * ly + y) * lx + x;
+        const double current = p[macro_idx];
+        const double previous = p_prev[global];
+        if (isfinite(current) && isfinite(previous)) {
+            delta = fabs(current - previous);
+            norm = fabs(current);
+        } else {
+            delta = INFINITY;
+            norm = INFINITY;
+        }
+        p_prev[global] = current;
+    }
+
+    s_delta[tid] = delta;
+    s_norm[tid] = norm;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_delta[tid] += s_delta[tid + stride];
+            s_norm[tid] += s_norm[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        block_error[2 * blockIdx.x] = s_delta[0];
+        block_error[2 * blockIdx.x + 1] = s_norm[0];
+    }
+}
+
+__global__ void finiteStateKernel(
+    const double* __restrict__ ff,
+    const double* __restrict__ gg,
+    const double* __restrict__ hh,
+    const double* __restrict__ rho,
+    const double* __restrict__ fei,
+    const double* __restrict__ u,
+    const double* __restrict__ v,
+    const double* __restrict__ w,
+    const double* __restrict__ p,
+    int* __restrict__ finite_flag,
+    int lx, int ly, int lz)
+{
+    const int cell = blockIdx.x * blockDim.x + threadIdx.x;
+    const int n = lx * ly * lz;
+    if (cell >= n)
+        return;
+
+    const int x = cell % lx;
+    const int y = (cell / lx) % ly;
+    const int z = cell / (lx * ly);
+    const int macro = ((z + 1) * ly + y) * lx + x;
+    bool finite = isfinite(rho[macro]) && isfinite(fei[macro]) &&
+                  isfinite(u[macro]) && isfinite(v[macro]) &&
+                  isfinite(w[macro]) && isfinite(p[macro]);
+    for (int q = 0; q < 15 && finite; ++q) {
+        const int id = cell * 15 + q;
+        finite = isfinite(ff[id]) && isfinite(gg[id]) && isfinite(hh[id]);
+    }
+    if (!finite)
+        atomicExch(finite_flag, 0);
+}
+
 // ==================== InamuroCUDA 成员实现 ====================
 
 InamuroCUDA::InamuroCUDA(const Inamuro& cpuSolver)
@@ -643,11 +757,22 @@ InamuroCUDA::InamuroCUDA(const Inamuro& cpuSolver)
     cpu.getGridSize(nx, ny, nz);
     lx = nx; ly = ny; lz = nz;
 
-    // 你的 CPU 代码里，宏观量通常在 z 上带 2 层 ghost
-    lz_total = lz + 2;
+    const std::uint64_t cells = static_cast<std::uint64_t>(lx) *
+                                static_cast<std::uint64_t>(ly) *
+                                static_cast<std::uint64_t>(lz);
+    if (lz > INT_MAX - 2)
+        throw std::runtime_error("grid z extent is too large");
+    const std::uint64_t macro_values = static_cast<std::uint64_t>(lx) *
+                                       static_cast<std::uint64_t>(ly) *
+                                       static_cast<std::uint64_t>(lz + 2);
+    if (cells == 0 || cells > static_cast<std::uint64_t>(INT_MAX / Q) ||
+        macro_values > static_cast<std::uint64_t>(INT_MAX))
+        throw std::runtime_error("grid exceeds the CUDA int-index safety limit");
 
-    N_cells = lx * ly * lz;
-    N_macro = lx * ly * lz_total;
+    // CPU代码里的宏观量在z上带2层ghost。
+    lz_total = lz + 2;
+    N_cells = static_cast<int>(cells);
+    N_macro = static_cast<int>(macro_values);
 
     // 从CPU获取参数（需要Inamuro声明friend或提供访问接口）
     params.rho_L = cpu.params.rho_L;
@@ -665,8 +790,13 @@ InamuroCUDA::InamuroCUDA(const Inamuro& cpuSolver)
     params.fei_G = cpu.params.fei_G;
 
     upload_lattice_constants();
-    allocateDeviceMemory();
-    initFromCPU();
+    try {
+        allocateDeviceMemory();
+        initFromCPU();
+    } catch (...) {
+        freeDeviceMemory();
+        throw;
+    }
 }
 
 InamuroCUDA::~InamuroCUDA()
@@ -683,6 +813,9 @@ void InamuroCUDA::allocateDeviceMemory()
     CUDA_CHECK(cudaMalloc(&gpu.d_ff, dist_bytes));
     CUDA_CHECK(cudaMalloc(&gpu.d_gg, dist_bytes));
     CUDA_CHECK(cudaMalloc(&gpu.d_hh, dist_bytes));
+    CUDA_CHECK(cudaMalloc(&gpu.d_ff_tmp, dist_bytes));
+    CUDA_CHECK(cudaMalloc(&gpu.d_gg_tmp, dist_bytes));
+    CUDA_CHECK(cudaMalloc(&gpu.d_hh_tmp, dist_bytes));
 
     CUDA_CHECK(cudaMalloc(&gpu.d_rho, macro_bytes));
     CUDA_CHECK(cudaMalloc(&gpu.d_fei, macro_bytes));
@@ -690,6 +823,12 @@ void InamuroCUDA::allocateDeviceMemory()
     CUDA_CHECK(cudaMalloc(&gpu.d_v,   macro_bytes));
     CUDA_CHECK(cudaMalloc(&gpu.d_w,   macro_bytes));
     CUDA_CHECK(cudaMalloc(&gpu.d_p,   macro_bytes));
+    CUDA_CHECK(cudaMalloc(&gpu.d_p_prev, cell_bytes));
+    const int residual_blocks = (N_cells + 255) / 256;
+    CUDA_CHECK(cudaMalloc(&gpu.d_pressure_error,
+                          static_cast<size_t>(2 * residual_blocks) * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&gpu.d_finite_flag, sizeof(int)));
+    CUDA_CHECK(cudaMemset(gpu.d_p_prev, 0, cell_bytes));
 
     // 梯度/拉普拉斯（预留，便于后续优化替换）
     CUDA_CHECK(cudaMalloc(&gpu.d_fei_x, cell_bytes));
@@ -722,7 +861,13 @@ void InamuroCUDA::freeDeviceMemory()
 {
     auto S = [](double*& p){ if(p){ cudaFree(p); p=nullptr; } };
     S(gpu.d_ff); S(gpu.d_gg); S(gpu.d_hh);
+    S(gpu.d_ff_tmp); S(gpu.d_gg_tmp); S(gpu.d_hh_tmp);
     S(gpu.d_rho); S(gpu.d_fei); S(gpu.d_u); S(gpu.d_v); S(gpu.d_w); S(gpu.d_p);
+    S(gpu.d_p_prev); S(gpu.d_pressure_error);
+    if (gpu.d_finite_flag) {
+        cudaFree(gpu.d_finite_flag);
+        gpu.d_finite_flag = nullptr;
+    }
     S(gpu.d_fei_x); S(gpu.d_fei_y); S(gpu.d_fei_z);
     S(gpu.d_rho_x); S(gpu.d_rho_y); S(gpu.d_rho_z);
     S(gpu.d_u_x);   S(gpu.d_u_y);   S(gpu.d_u_z);
@@ -735,9 +880,10 @@ void InamuroCUDA::freeDeviceMemory()
 void InamuroCUDA::initFromCPU()
 {
     // ------- 分布函数：Q * N_cells -------
-    std::vector<double> h_ff(N_cells * 15);
-    std::vector<double> h_gg(N_cells * 15);
-    std::vector<double> h_hh(N_cells * 15);
+    const size_t distribution_values = static_cast<size_t>(N_cells) * Q;
+    std::vector<double> h_ff(distribution_values);
+    std::vector<double> h_gg(distribution_values);
+    std::vector<double> h_hh(distribution_values);
 
     for (int z = 0; z < lz; ++z)
     for (int y = 0; y < ly; ++y)
@@ -762,7 +908,7 @@ void InamuroCUDA::initFromCPU()
     for (int z = 0; z < lz_total; ++z)
     for (int y = 0; y < ly; ++y)
     for (int x = 0; x < lx; ++x) {
-        const int id3 = idx3D(x, y, z, lx, ly, lz_total);
+        const int id3 = idx3D(x, y, z, lx, ly);
         h_rho[id3] = cpu.rho[x][y][z];
         h_fei[id3] = cpu.fei[x][y][z];
         h_u[id3]   = cpu.u[x][y][z];
@@ -792,7 +938,7 @@ void InamuroCUDA::downloadMacroToCPU(Inamuro& cpuSolver) const
     for (int z = 0; z < lz_total; ++z)
     for (int y = 0; y < ly; ++y)
     for (int x = 0; x < lx; ++x) {
-        const int id3 = idx3D(x, y, z, lx, ly, lz_total);
+        const int id3 = idx3D(x, y, z, lx, ly);
         cpuSolver.rho[x][y][z] = h_rho[id3];
         cpuSolver.fei[x][y][z] = h_fei[id3];
         cpuSolver.u[x][y][z]   = h_u[id3];
@@ -802,8 +948,30 @@ void InamuroCUDA::downloadMacroToCPU(Inamuro& cpuSolver) const
     }
 }
 
+void InamuroCUDA::downloadDistributionsToCPU(Inamuro& cpuSolver) const
+{
+    const size_t values = static_cast<size_t>(N_cells) * Q;
+    std::vector<double> h_ff(values), h_gg(values), h_hh(values);
+    CUDA_CHECK(cudaMemcpy(h_ff.data(), gpu.d_ff, values * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_gg.data(), gpu.d_gg, values * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_hh.data(), gpu.d_hh, values * sizeof(double), cudaMemcpyDeviceToHost));
+
+    for (int z = 0; z < lz; ++z)
+    for (int y = 0; y < ly; ++y)
+    for (int x = 0; x < lx; ++x) {
+        const int cell = (z * ly + y) * lx + x;
+        for (int q = 0; q < Q; ++q) {
+            const int id = cell * Q + q;
+            cpuSolver.ff[q][x][y][z] = h_ff[id];
+            cpuSolver.gg[q][x][y][z] = h_gg[id];
+            cpuSolver.hh[q][x][y][z] = h_hh[id];
+        }
+    }
+}
+
 void InamuroCUDA::downloadFieldsToCPU(Inamuro& cpuSolver) const
 {
+    downloadDistributionsToCPU(cpuSolver);
     downloadMacroToCPU(cpuSolver);
 }
 
@@ -859,20 +1027,18 @@ void InamuroCUDA::doStreamFF()
 {
     dim3 block(8,8,8);
     dim3 grid((lx+block.x-1)/block.x, (ly+block.y-1)/block.y, (lz+block.z-1)/block.z);
-    // 简单用 ff 本地做一次 pull streaming 示例（现实中应使用 ping-pong 或 AA/奇偶步）
-    // 这里用 d_hh 作为临时缓冲，避免覆盖
-    streamKernel<<<grid, block>>>(gpu.d_ff, gpu.d_hh, lx, ly, lz);
+    streamKernel<<<grid, block>>>(gpu.d_ff, gpu.d_ff_tmp, lx, ly, lz);
     CUDA_CHECK(cudaGetLastError());
-    std::swap(gpu.d_ff, gpu.d_hh);
+    std::swap(gpu.d_ff, gpu.d_ff_tmp);
 }
 
 void InamuroCUDA::doStreamGG()
 {
     dim3 block(8,8,8);
     dim3 grid((lx+block.x-1)/block.x, (ly+block.y-1)/block.y, (lz+block.z-1)/block.z);
-    streamKernel<<<grid, block>>>(gpu.d_gg, gpu.d_hh, lx, ly, lz);
+    streamKernel<<<grid, block>>>(gpu.d_gg, gpu.d_gg_tmp, lx, ly, lz);
     CUDA_CHECK(cudaGetLastError());
-    std::swap(gpu.d_gg, gpu.d_hh);
+    std::swap(gpu.d_gg, gpu.d_gg_tmp);
 }
 
 void InamuroCUDA::doBoundaryFF()
@@ -906,6 +1072,61 @@ void InamuroCUDA::doMacro()
     CUDA_CHECK(cudaGetLastError());
 }
 
+double InamuroCUDA::computePressureResidual()
+{
+    constexpr int threads = 256;
+    const int blocks = (N_cells + threads - 1) / threads;
+    pressureErrorKernel<<<blocks, threads, 2 * threads * sizeof(double)>>>(
+        gpu.d_p, gpu.d_p_prev, gpu.d_pressure_error, lx, ly, lz);
+    CUDA_CHECK(cudaGetLastError());
+
+    std::vector<double> block_error(static_cast<size_t>(2 * blocks));
+    CUDA_CHECK(cudaMemcpy(block_error.data(), gpu.d_pressure_error,
+                          block_error.size() * sizeof(double), cudaMemcpyDeviceToHost));
+
+    double delta_sum = 0.0, delta_comp = 0.0;
+    double norm_sum = 0.0, norm_comp = 0.0;
+    auto kahan_add = [](double value, double& sum, double& compensation) {
+        const double adjusted = value - compensation;
+        const double next = sum + adjusted;
+        compensation = (next - sum) - adjusted;
+        sum = next;
+    };
+    for (int block = 0; block < blocks; ++block) {
+        kahan_add(block_error[2 * block], delta_sum, delta_comp);
+        kahan_add(block_error[2 * block + 1], norm_sum, norm_comp);
+    }
+
+    if (norm_sum > 0.0)
+        return delta_sum / norm_sum;
+    return (delta_sum == 0.0) ? 0.0 : std::numeric_limits<double>::infinity();
+}
+
+bool InamuroCUDA::validateFiniteState()
+{
+    const int one = 1;
+    CUDA_CHECK(cudaMemcpy(gpu.d_finite_flag, &one, sizeof(one), cudaMemcpyHostToDevice));
+    constexpr int threads = 256;
+    const int blocks = (N_cells + threads - 1) / threads;
+    finiteStateKernel<<<blocks, threads>>>(
+        gpu.d_ff, gpu.d_gg, gpu.d_hh,
+        gpu.d_rho, gpu.d_fei, gpu.d_u, gpu.d_v, gpu.d_w, gpu.d_p,
+        gpu.d_finite_flag, lx, ly, lz);
+    CUDA_CHECK(cudaGetLastError());
+    int finite = 0;
+    CUDA_CHECK(cudaMemcpy(&finite, gpu.d_finite_flag, sizeof(finite), cudaMemcpyDeviceToHost));
+    return finite == 1;
+}
+
+#ifdef LBM_TESTING
+bool InamuroCUDA::testFiniteGateRejectsNaN()
+{
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    CUDA_CHECK(cudaMemcpy(gpu.d_gg, &nan, sizeof(nan), cudaMemcpyHostToDevice));
+    return !validateFiniteState();
+}
+#endif
+
 void InamuroCUDA::doPressurePoisson()
 {
     dim3 block(8, 8, 8);
@@ -913,8 +1134,10 @@ void InamuroCUDA::doPressurePoisson()
     dim3 block2d(16, 16);
     dim3 grid2d((ly+block2d.x-1)/block2d.x, (lz+block2d.y-1)/block2d.y);
 
-    // 压力泊松迭代求解（简化版本，最多1000次迭代）
-    for (int iter = 0; iter < 1000; ++iter) {
+    last_poisson = {};
+    last_poisson.relative_residual = std::numeric_limits<double>::infinity();
+
+    for (int iter = 1; iter <= kPoissonMaxIterations; ++iter) {
         // 1. 压力碰撞
         collisionPressureKernel<<<grid, block>>>(
             gpu.d_hh, gpu.d_p, gpu.d_rho,
@@ -924,8 +1147,9 @@ void InamuroCUDA::doPressurePoisson()
         CUDA_CHECK(cudaGetLastError());
 
         // 2. hh迁移
-        streamKernel<<<grid, block>>>(gpu.d_hh, gpu.d_ff, lx, ly, lz);
-        std::swap(gpu.d_hh, gpu.d_ff);
+        streamKernel<<<grid, block>>>(gpu.d_hh, gpu.d_hh_tmp, lx, ly, lz);
+        CUDA_CHECK(cudaGetLastError());
+        std::swap(gpu.d_hh, gpu.d_hh_tmp);
         
         // 3. hh边界
         slipBounceBackKernel<<<grid2d, block2d>>>(gpu.d_hh, lx, ly, lz);
@@ -938,10 +1162,20 @@ void InamuroCUDA::doPressurePoisson()
         );
         CUDA_CHECK(cudaGetLastError());
 
-        // TODO: 每100步检查收敛性（需要实现残差计算）
-        // 简化版本：固定迭代次数
-        if (iter >= 100) break;  // 暂时迭代100次
+        if (iter % kPoissonCheckInterval == 0) {
+            const double residual = computePressureResidual();
+            last_poisson.iterations = iter;
+            last_poisson.relative_residual = residual;
+            last_poisson.residual_trace.push_back(residual);
+            last_poisson.finite = std::isfinite(residual);
+            last_poisson.converged = last_poisson.finite && residual < kPoissonTolerance;
+            if (!last_poisson.finite)
+                throw std::runtime_error("GPU Poisson残差出现NaN/Inf");
+            if (last_poisson.converged)
+                break;
+        }
     }
+    perf.total_poisson_iterations += last_poisson.iterations;
 }
 
 void InamuroCUDA::doCorrectUVWAndHH()
@@ -967,32 +1201,30 @@ void InamuroCUDA::doCorrectUVWAndHH()
 
 void InamuroCUDA::performTimeStepGPU()
 {
-    cudaEvent_t start, stop;
+    const auto wall_start = std::chrono::steady_clock::now();
+    ScopedCudaEvents events;
     float milliseconds = 0;
-    
-    if (enable_timing) {
-        cudaEventCreate(&start);
-        cudaEventCreate(&stop);
-    }
+    if (enable_timing)
+        events.create();
     
     // 1) 碰撞 + 求导/拉普拉斯
-    if (enable_timing) cudaEventRecord(start);
+    if (enable_timing) CUDA_CHECK(cudaEventRecord(events.start));
     doCollisionAndGradients();
     if (enable_timing) {
-        cudaEventRecord(stop);
-        cudaEventSynchronize(stop);
-        cudaEventElapsedTime(&milliseconds, start, stop);
+        CUDA_CHECK(cudaEventRecord(events.stop));
+        CUDA_CHECK(cudaEventSynchronize(events.stop));
+        CUDA_CHECK(cudaEventElapsedTime(&milliseconds, events.start, events.stop));
         perf.total_collision_time += milliseconds;
     }
 
     // 2) 迁移
-    if (enable_timing) cudaEventRecord(start);
+    if (enable_timing) CUDA_CHECK(cudaEventRecord(events.start));
     doStreamFF();
     doStreamGG();
     if (enable_timing) {
-        cudaEventRecord(stop);
-        cudaEventSynchronize(stop);
-        cudaEventElapsedTime(&milliseconds, start, stop);
+        CUDA_CHECK(cudaEventRecord(events.stop));
+        CUDA_CHECK(cudaEventSynchronize(events.stop));
+        CUDA_CHECK(cudaEventElapsedTime(&milliseconds, events.start, events.stop));
         perf.total_stream_time += milliseconds;
     }
 
@@ -1001,33 +1233,36 @@ void InamuroCUDA::performTimeStepGPU()
     doBoundaryGG();
 
     // 4) 宏观量
-    if (enable_timing) cudaEventRecord(start);
+    if (enable_timing) CUDA_CHECK(cudaEventRecord(events.start));
     doMacro();
     if (enable_timing) {
-        cudaEventRecord(stop);
-        cudaEventSynchronize(stop);
-        cudaEventElapsedTime(&milliseconds, start, stop);
+        CUDA_CHECK(cudaEventRecord(events.stop));
+        CUDA_CHECK(cudaEventSynchronize(events.stop));
+        CUDA_CHECK(cudaEventElapsedTime(&milliseconds, events.start, events.stop));
         perf.total_macro_time += milliseconds;
     }
 
     // 5) 压力 Poisson
-    if (enable_timing) cudaEventRecord(start);
+    if (enable_timing) CUDA_CHECK(cudaEventRecord(events.start));
     doPressurePoisson();
     if (enable_timing) {
-        cudaEventRecord(stop);
-        cudaEventSynchronize(stop);
-        cudaEventElapsedTime(&milliseconds, start, stop);
+        CUDA_CHECK(cudaEventRecord(events.stop));
+        CUDA_CHECK(cudaEventSynchronize(events.stop));
+        CUDA_CHECK(cudaEventElapsedTime(&milliseconds, events.start, events.stop));
         perf.total_poisson_time += milliseconds;
     }
 
     // 6) 速度修正 + hh 更新
     doCorrectUVWAndHH();
-    
+    if (!validateFiniteState())
+        throw std::runtime_error("GPU state contains NaN/Inf after the solver step");
+    CUDA_CHECK(cudaDeviceSynchronize());
     if (enable_timing) {
-        perf.time_step_count++;
-        cudaEventDestroy(start);
-        cudaEventDestroy(stop);
+        const auto wall_stop = std::chrono::steady_clock::now();
+        perf.total_step_wall_time +=
+            std::chrono::duration<double, std::milli>(wall_stop - wall_start).count();
     }
+    perf.time_step_count++;
     
     if (enable_debug && perf.time_step_count % 100 == 0) {
         std::cout << "[DEBUG] Time step " << perf.time_step_count << " completed" << std::endl;
@@ -1045,17 +1280,22 @@ void InamuroCUDA::printPerformanceMetrics() const
     
     std::cout << "\n========== GPU Performance Metrics ==========" << std::endl;
     std::cout << "Total time steps: " << perf.time_step_count << std::endl;
-    std::cout << "\nAverage time per kernel (ms):" << std::endl;
+    std::cout << "\nAverage timed phases (ms):" << std::endl;
     std::cout << "  Collision:      " << perf.total_collision_time / perf.time_step_count << std::endl;
     std::cout << "  Stream:         " << perf.total_stream_time / perf.time_step_count << std::endl;
     std::cout << "  Macro:          " << perf.total_macro_time / perf.time_step_count << std::endl;
     std::cout << "  Poisson:        " << perf.total_poisson_time / perf.time_step_count << std::endl;
+    std::cout << "  Poisson iters:  "
+              << static_cast<double>(perf.total_poisson_iterations) / perf.time_step_count << std::endl;
+
+    const double phase_subtotal = (perf.total_collision_time + perf.total_stream_time +
+                                   perf.total_macro_time + perf.total_poisson_time) /
+                                  perf.time_step_count;
+    std::cout << "  Timed phase subtotal:      " << phase_subtotal << std::endl;
+    std::cout << "  Complete solver-step wall: "
+              << perf.total_step_wall_time / perf.time_step_count << std::endl;
     
-    double total_avg = (perf.total_collision_time + perf.total_stream_time + 
-                        perf.total_macro_time + perf.total_poisson_time) / perf.time_step_count;
-    std::cout << "  Total per step: " << total_avg << std::endl;
-    
-    std::cout << "\nKernel time distribution:" << std::endl;
+    std::cout << "\nTimed phase distribution:" << std::endl;
     double total = perf.total_collision_time + perf.total_stream_time + 
                    perf.total_macro_time + perf.total_poisson_time;
     std::cout << "  Collision:      " << (perf.total_collision_time / total * 100) << "%" << std::endl;
@@ -1071,5 +1311,7 @@ void InamuroCUDA::resetPerformanceMetrics()
     perf.total_stream_time = 0.0;
     perf.total_macro_time = 0.0;
     perf.total_poisson_time = 0.0;
+    perf.total_step_wall_time = 0.0;
+    perf.total_poisson_iterations = 0;
     perf.time_step_count = 0;
 }
